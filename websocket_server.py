@@ -13,6 +13,7 @@ import base64
 import os
 import re as _re
 import random
+from typing import Optional
 from aiohttp import web
 import aiohttp
 from collections import deque
