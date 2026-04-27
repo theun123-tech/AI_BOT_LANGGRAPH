@@ -313,20 +313,42 @@ from openai import RateLimitError, APIStatusError
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 
 # ── Connection keepalive configuration ────────────────────────────────────────
-# httpx default keepalive_expiry is 5s, which causes connections to go COLD
-# between turns in a voice meeting (200-500ms penalty per cold connection).
-# We override to keep connections alive for the entire meeting duration.
-KEEPALIVE_EXPIRY_SECONDS = 300.0        # 5 min — survives long pauses
+# We use TWO mechanisms to keep TCP connections warm WITHOUT spending API quota:
+#
+# 1. httpx pool keepalive_expiry — keeps a connection in the local pool for N
+#    seconds after last use. If reused within that window, no TCP+TLS handshake.
+#    Cost: zero. Just configuration.
+#
+# 2. TCP-level SO_KEEPALIVE — kernel sends silent TCP keepalive probes on idle
+#    connections. Detects+heals dead sockets before the next HTTP request would
+#    time out. Doesn't keep the connection from closing on Groq's side, but
+#    catches mid-network NAT/proxy resets.
+#    Cost: zero. Kernel-level packets, not API requests.
+#
+# What we DO NOT do anymore: send periodic chat.completions.create() pings to
+# keep keys "warm". On Groq free tier (30 RPM org-wide), 12-key warmup loops
+# burned 24+ req/min just for keepalive, leaving almost nothing for real
+# user traffic. Functions warm_all_keys() and start_keepalive_task() now
+# no-op by default. Set GROQ_KEEPALIVE_API_PINGS=1 to re-enable (only if you
+# upgrade to Groq Dev tier with 300+ RPM).
+KEEPALIVE_EXPIRY_SECONDS = 600.0        # 10 min — covers most proxy idle timeouts
 MAX_KEEPALIVE_CONNECTIONS = 4           # per key — enough for bursts
 CONNECT_TIMEOUT_SECONDS = 10.0
 READ_TIMEOUT_SECONDS = 60.0             # Groq can stream for a while
 
-# Keepalive ping interval — send a 1-token request per key to prevent idle
-# connection close. 30s is safe; Groq's TPM resets per minute so this is
-# ~0.03% of your quota.
+# TCP-level socket keepalive (Linux/macOS). Sends silent probes on idle sockets.
+TCP_KEEPALIVE_IDLE_SECONDS = 60         # start probing after 60s idle
+TCP_KEEPALIVE_INTERVAL_SECONDS = 30     # probe every 30s
+TCP_KEEPALIVE_PROBE_COUNT = 3           # close after 3 missed probes
+
+# Ping interval (only used if API pings are explicitly re-enabled — see above)
 KEEPALIVE_PING_INTERVAL_SECONDS = 30.0
-# Model to use for keepalive pings — the fastest/cheapest on Groq.
 KEEPALIVE_PING_MODEL = "llama-3.1-8b-instant"
+
+# Master switch for the OLD API-ping behavior. Default off because it hits
+# Groq free-tier rate limits hard. Re-enable only on Dev tier (300+ RPM).
+import os as _kp_os
+GROQ_KEEPALIVE_API_PINGS = _kp_os.environ.get("GROQ_KEEPALIVE_API_PINGS", "0") == "1"
 
 # ── Module-level shared rotator singleton ─────────────────────────────────────
 # All callers of get_shared_groq_rotator() get the SAME instance. This is how
@@ -416,29 +438,82 @@ class GroqRotatingClient:
         self._http_clients: dict[str, httpx.AsyncClient] = {}
 
     def _build_httpx_client(self) -> httpx.AsyncClient:
-        """Build a fresh httpx AsyncClient with LONG keepalive.
+        """Build a fresh httpx AsyncClient with two layers of keepalive:
 
-        This is the critical fix: default httpx.Limits.keepalive_expiry=5s
-        causes connections to close between turns, forcing TCP+TLS re-setup
-        on every call. We push this to 5 minutes so a single meeting keeps
-        all 12 connections warm end-to-end.
+        Layer 1 — httpx pool keepalive: sockets stay in the pool for
+        KEEPALIVE_EXPIRY_SECONDS (10 min) after last use, ready for instant
+        reuse with no TCP+TLS handshake.
+
+        Layer 2 — TCP socket keepalive: kernel sends silent TCP probes on idle
+        sockets so dead connections (NAT/proxy timeouts) get detected and
+        evicted from the pool BEFORE the next request hits a stale socket.
+
+        Together these give "warm-feeling" connections without spending any
+        API request quota — critical on Groq's 30 RPM free tier.
         """
-        return httpx.AsyncClient(
-            limits=httpx.Limits(
-                max_keepalive_connections=MAX_KEEPALIVE_CONNECTIONS,
-                max_connections=MAX_KEEPALIVE_CONNECTIONS * 2,
-                keepalive_expiry=KEEPALIVE_EXPIRY_SECONDS,
-            ),
-            timeout=httpx.Timeout(
-                connect=CONNECT_TIMEOUT_SECONDS,
-                read=READ_TIMEOUT_SECONDS,
-                write=10.0,
-                pool=5.0,
-            ),
-            # http2=True requires the 'h2' package. Leave False unless
-            # you've verified h2 is installed — otherwise httpx raises.
-            http2=False,
-        )
+        # Build a transport that sets SO_KEEPALIVE on every socket it opens.
+        # httpx itself doesn't expose this — we hook it via the underlying
+        # httpcore transport's socket-options parameter.
+        try:
+            import socket
+            socket_options = [
+                # Enable keepalive
+                (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+            ]
+            # Linux-specific TCP_KEEPIDLE/INTVL/CNT (silently skipped on macOS)
+            if hasattr(socket, "TCP_KEEPIDLE"):
+                socket_options.append(
+                    (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP_KEEPALIVE_IDLE_SECONDS))
+            if hasattr(socket, "TCP_KEEPINTVL"):
+                socket_options.append(
+                    (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, TCP_KEEPALIVE_INTERVAL_SECONDS))
+            if hasattr(socket, "TCP_KEEPCNT"):
+                socket_options.append(
+                    (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEPALIVE_PROBE_COUNT))
+            # macOS uses TCP_KEEPALIVE in seconds (not the Linux triple)
+            elif hasattr(socket, "TCP_KEEPALIVE"):
+                socket_options.append(
+                    (socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, TCP_KEEPALIVE_IDLE_SECONDS))
+
+            transport = httpx.AsyncHTTPTransport(
+                limits=httpx.Limits(
+                    max_keepalive_connections=MAX_KEEPALIVE_CONNECTIONS,
+                    max_connections=MAX_KEEPALIVE_CONNECTIONS * 2,
+                    keepalive_expiry=KEEPALIVE_EXPIRY_SECONDS,
+                ),
+                socket_options=socket_options,
+                http2=False,
+                retries=0,
+            )
+
+            return httpx.AsyncClient(
+                transport=transport,
+                timeout=httpx.Timeout(
+                    connect=CONNECT_TIMEOUT_SECONDS,
+                    read=READ_TIMEOUT_SECONDS,
+                    write=10.0,
+                    pool=5.0,
+                ),
+            )
+        except Exception as e:
+            # Fall back to plain httpx config if the transport-level config
+            # fails (rare, but safer than crashing on a Windows oddity)
+            print(f"[GroqRotator] ⚠️  TCP keepalive setup failed ({e}) — "
+                  f"falling back to pool-only keepalive")
+            return httpx.AsyncClient(
+                limits=httpx.Limits(
+                    max_keepalive_connections=MAX_KEEPALIVE_CONNECTIONS,
+                    max_connections=MAX_KEEPALIVE_CONNECTIONS * 2,
+                    keepalive_expiry=KEEPALIVE_EXPIRY_SECONDS,
+                ),
+                timeout=httpx.Timeout(
+                    connect=CONNECT_TIMEOUT_SECONDS,
+                    read=READ_TIMEOUT_SECONDS,
+                    write=10.0,
+                    pool=5.0,
+                ),
+                http2=False,
+            )
 
     async def _get_client_for_key(self, key: str) -> AsyncOpenAI:
         """Get (or lazily create) the AsyncOpenAI client bound to this key.
@@ -528,18 +603,27 @@ class GroqRotatingClient:
         )
 
     async def warm_all_keys(self) -> None:
-        """Warm up HTTP connections for EVERY key in the rotator.
+        """Warm up HTTP connections for every key in the rotator.
 
-        Sends a tiny (1-token) request per key to force TCP+TLS handshake.
-        After this completes, all 12 keys have live HTTP/1.1 connections
-        ready to use — eliminating the 200-500ms cold-start penalty that
-        shows up as "Stream opened: 964ms" in your logs.
+        DISABLED BY DEFAULT (set GROQ_KEEPALIVE_API_PINGS=1 to enable).
 
-        Call this ONCE during session setup, AFTER the rotator has loaded
-        keys. Safe to call multiple times.
+        This used to send a 1-token chat.completions.create() to each of
+        your 12 keys at session start (and again every 30s via the keepalive
+        loop). On Groq's free tier — where rate limits are 30 RPM applied
+        ORG-WIDE, not per key — that burned 24+ requests/min purely for
+        warmup, leaving almost nothing for actual user turns. This was the
+        cause of the rate-limit storms in production.
 
-        Expected runtime: ~0.5-2s total (all keys warmed in parallel).
+        TCP+TLS warmth is now handled for free by:
+          1. httpx pool keepalive (10 min — see KEEPALIVE_EXPIRY_SECONDS)
+          2. SO_KEEPALIVE TCP probes (kernel-level, no API cost)
+
+        Calling this is a no-op by default. Re-enable only on Groq Dev tier
+        (300+ RPM) where the API quota cost is negligible.
         """
+        if not GROQ_KEEPALIVE_API_PINGS:
+            return  # no-op — see docstring
+
         if not self._rotator.is_enabled():
             return
 
@@ -575,18 +659,21 @@ class GroqRotatingClient:
         print(f"[GroqRotator] {self._tag} 🔥 Warmed {count} key(s) — "
               f"connections alive for {KEEPALIVE_EXPIRY_SECONDS:.0f}s")
 
-    def start_keepalive_task(self) -> asyncio.Task:
+    def start_keepalive_task(self) -> Optional[asyncio.Task]:
         """Start a background task that pings all keys every 30s.
 
-        This prevents ANY key's HTTP connection from going idle and getting
-        closed. Without this, if a specific key isn't used for 5+ minutes
-        (longer than keepalive_expiry), the connection drops and the next
-        call on that key pays the 200-500ms cold-start tax.
+        DISABLED BY DEFAULT (set GROQ_KEEPALIVE_API_PINGS=1 to enable).
 
-        Call once during session setup. Cancel via close() at session end.
+        Returns None when disabled. See warm_all_keys() docstring for the
+        rate-limit explanation. TCP socket keepalive (kernel-level, free)
+        and httpx pool keepalive (10 min) handle warmth without API quota.
 
-        Returns the task so the caller can await/cancel it explicitly.
+        When re-enabled (Groq Dev tier only), starts a loop that calls
+        warm_all_keys() every KEEPALIVE_PING_INTERVAL_SECONDS.
         """
+        if not GROQ_KEEPALIVE_API_PINGS:
+            return None  # no-op — see warm_all_keys docstring
+
         if self._keepalive_task is not None and not self._keepalive_task.done():
             return self._keepalive_task
 
