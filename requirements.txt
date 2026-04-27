@@ -4,5 +4,6 @@ openai
 pydub
 numpy
 fastembed
+websockets
 python-dotenv
 langgraph
