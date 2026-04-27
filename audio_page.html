@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Sam Audio</title>
+<style>
+body { margin:0; background:#111; display:flex; align-items:center; justify-content:center; height:100vh; font-family:system-ui; color:#fff; overflow:hidden; }
+.container { text-align:center; position:relative; width:100vw; height:100vh; display:flex; align-items:center; justify-content:center; }
+
+/* Static avatar (shown when no Simli or before Simli connects) */
+.avatar-static { text-align:center; }
+.avatar-circle { width:120px; height:120px; border-radius:50%; background:linear-gradient(135deg,#3b82f6,#8b5cf6); display:flex; align-items:center; justify-content:center; font-size:48px; margin:0 auto 16px; transition:box-shadow 0.3s; }
+.avatar-circle.speaking { box-shadow:0 0 40px rgba(59,130,246,0.6), 0 0 80px rgba(59,130,246,0.3); animation:pulse 1.5s ease-in-out infinite; }
+@keyframes pulse { 0%,100%{transform:scale(1)} 50%{transform:scale(1.05)} }
+
+/* Simli video avatar (shown when Simli connected) */
+#simli-video { display:none; width:100vw; height:100vh; object-fit:cover; background:#111; }
+#simli-video.active { display:block; }
+
+/* Simli audio (hidden, plays Simli's lip-sync audio — we mute this, use our own AudioWorklet) */
+#simli-audio { display:none; }
+
+.status { font-size:14px; color:#888; margin-top:8px; position:absolute; bottom:20px; left:50%; transform:translateX(-50%); }
+.status.connected { color:#10b981; }
+</style>
+</head>
+<body>
+<div class="container">
+  <!-- Static avatar (fallback / pre-Simli) -->
+  <div id="avatar-static" class="avatar-static">
+    <div id="avatar" class="avatar-circle">🤖</div>
+    <div>Sam</div>
+  </div>
+
+  <!-- Simli video avatar -->
+  <video id="simli-video" autoplay playsinline muted></video>
+  <audio id="simli-audio" autoplay></audio>
+
+  <div id="status" class="status">Connecting...</div>
+</div>
+
+<script>
+// ── AudioWorklet processor (same as before) ─────────────────────────────
+const workletCode = `
+class PCMPlayerProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.bufferSize = 5760000;
+    this.buffer = new Float32Array(this.bufferSize);
+    this.writePos = 0;
+    this.readPos = 0;
+    this.buffered = 0;
+    this.started = false;
+    this.silentFrames = 0;
+
+    this.port.onmessage = (e) => {
+      if (e.data.type === 'pcm') {
+        const samples = e.data.samples;
+        for (let i = 0; i < samples.length; i++) {
+          this.buffer[this.writePos] = samples[i];
+          this.writePos = (this.writePos + 1) % this.bufferSize;
+        }
+        this.buffered = Math.min(this.buffered + samples.length, this.bufferSize);
+        this.silentFrames = 0;
+        if (!this.started && this.buffered > 2400) {
+          this.started = true;
+          this.port.postMessage({ type: 'started' });
+        }
+      } else if (e.data.type === 'stop') {
+        this.buffered = 0;
+        this.readPos = this.writePos;
+        this.started = false;
+        this.silentFrames = 0;
+        this.port.postMessage({ type: 'stopped' });
+      }
+    };
+  }
+
+  process(inputs, outputs) {
+    if (!this.started) return true;
+    const output = outputs[0][0];
+    for (let i = 0; i < output.length; i++) {
+      if (this.buffered > 0) {
+        output[i] = this.buffer[this.readPos];
+        this.readPos = (this.readPos + 1) % this.bufferSize;
+        this.buffered--;
+        this.silentFrames = 0;
+      } else {
+        output[i] = 0;
+        this.silentFrames++;
+      }
+    }
+    if (this.silentFrames > 24000 && this.started) {
+      this.started = false;
+      this.silentFrames = 0;
+      this.port.postMessage({ type: 'drained' });
+    }
+    return true;
+  }
+}
+registerProcessor('pcm-player', PCMPlayerProcessor);
+`;
+
+// ── Config ───────────────────────────────────────────────────────────────
+const params = new URLSearchParams(window.location.search);
+const sessionId = params.get('session');
+const token = params.get('token') || '';
+const simliApiKey = params.get('simli_key') || '';
+const simliFaceId = params.get('face_id') || '';
+const simliEnabled = !!(simliApiKey && simliFaceId);
+
+const SIMLI_API = 'https://api.simli.ai';
+
+const statusEl = document.getElementById('status');
+const avatarEl = document.getElementById('avatar');
+const avatarStaticEl = document.getElementById('avatar-static');
+const simliVideoEl = document.getElementById('simli-video');
+const simliAudioEl = document.getElementById('simli-audio');
+
+let audioCtx = null;
+let workletNode = null;
+let ws = null;
+let reconnectTimer = null;
+
+// Simli state
+let simliWs = null;
+let simliPc = null;
+let simliReady = false;
+let simliSendBuffer = [];   // Buffer 16kHz PCM chunks before Simli is ready
+const SIMLI_CHUNK_SIZE = 6000; // Preferred chunk size in bytes
+
+// ── AudioWorklet init ────────────────────────────────────────────────────
+async function initAudio() {
+  audioCtx = new AudioContext({ sampleRate: 48000 });
+  const blob = new Blob([workletCode], { type: 'application/javascript' });
+  const url = URL.createObjectURL(blob);
+  await audioCtx.audioWorklet.addModule(url);
+  URL.revokeObjectURL(url);
+
+  workletNode = new AudioWorkletNode(audioCtx, 'pcm-player');
+  workletNode.connect(audioCtx.destination);
+
+  workletNode.port.onmessage = (e) => {
+    if (e.data.type === 'started') {
+      avatarEl.classList.add('speaking');
+    } else if (e.data.type === 'drained' || e.data.type === 'stopped') {
+      avatarEl.classList.remove('speaking');
+    }
+  };
+  console.log('[Audio] AudioWorklet initialized at 48kHz');
+}
+
+// ── Downsample 48kHz → 16kHz (take every 3rd sample) ────────────────────
+function downsample48to16(int16Array) {
+  const ratio = 3; // 48000 / 16000
+  const outLen = Math.floor(int16Array.length / ratio);
+  const out = new Int16Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    out[i] = int16Array[i * ratio];
+  }
+  return out;
+}
+
+// ── Simli: send PCM chunk ────────────────────────────────────────────────
+function sendToSimli(int16_16khz) {
+  if (!simliEnabled) return;
+
+  // Buffer chunks to preferred size
+  const bytes = new Uint8Array(int16_16khz.buffer, int16_16khz.byteOffset, int16_16khz.byteLength);
+  simliSendBuffer.push(bytes);
+
+  // Calculate total buffered bytes
+  let totalBytes = 0;
+  for (const chunk of simliSendBuffer) totalBytes += chunk.length;
+
+  // Send when we have enough
+  while (totalBytes >= SIMLI_CHUNK_SIZE) {
+    const combined = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of simliSendBuffer) {
+      combined.set(chunk, offset);
+      offset += chunk.length;
+    }
+    simliSendBuffer = [];
+    totalBytes = 0;
+
+    // Send SIMLI_CHUNK_SIZE and keep remainder
+    const toSend = combined.slice(0, SIMLI_CHUNK_SIZE);
+    const remainder = combined.slice(SIMLI_CHUNK_SIZE);
+
+    if (simliReady && simliWs && simliWs.readyState === WebSocket.OPEN) {
+      simliWs.send(toSend);
+    }
+
+    if (remainder.length > 0) {
+      simliSendBuffer.push(remainder);
+      totalBytes = remainder.length;
+    }
+  }
+}
+
+// Flush remaining buffer to Simli
+function flushSimliBuffer() {
+  if (!simliReady || !simliWs || simliWs.readyState !== WebSocket.OPEN) return;
+  if (simliSendBuffer.length === 0) return;
+
+  let totalBytes = 0;
+  for (const chunk of simliSendBuffer) totalBytes += chunk.length;
+  if (totalBytes === 0) return;
+
+  const combined = new Uint8Array(totalBytes);
+  let offset = 0;
+  for (const chunk of simliSendBuffer) {
+    combined.set(chunk, offset);
+    offset += chunk.length;
+  }
+  simliSendBuffer = [];
+  simliWs.send(combined);
+}
+
+// ── Simli: initialize WebRTC connection ──────────────────────────────────
+async function initSimli() {
+  if (!simliEnabled) {
+    console.log('[Simli] Not configured, using static avatar');
+    return;
+  }
+
+  console.log('[Simli] Initializing avatar...');
+
+  try {
+    // 1. Get session token
+    const tokenResp = await fetch(`${SIMLI_API}/compose/token`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-simli-api-key': simliApiKey,
+      },
+      body: JSON.stringify({
+        faceId: simliFaceId,
+        handleSilence: true,
+        maxSessionLength: 3600,
+        maxIdleTime: 300,
+        audioInputFormat: 'pcm16',
+      }),
+    });
+
+    if (!tokenResp.ok) {
+      throw new Error(`Token request failed: ${tokenResp.status}`);
+    }
+
+    const { session_token } = await tokenResp.json();
+    console.log('[Simli] Got session token');
+
+    // 2. Get ICE servers
+    const iceResp = await fetch(`${SIMLI_API}/compose/ice`, {
+      headers: { 'x-simli-api-key': simliApiKey },
+    });
+    const iceServers = await iceResp.json();
+    console.log('[Simli] Got ICE servers');
+
+    // 3. Create PeerConnection
+    simliPc = new RTCPeerConnection({
+      sdpSemantics: 'unified-plan',
+      iceServers: iceServers,
+    });
+
+    simliPc.addEventListener('iceconnectionstatechange', () => {
+      console.log('[Simli] ICE state:', simliPc.iceConnectionState);
+      if (simliPc.iceConnectionState === 'failed' || simliPc.iceConnectionState === 'disconnected') {
+        console.warn('[Simli] ICE connection lost');
+        simliReady = false;
+      }
+    });
+
+    // 4. Handle incoming tracks (video + audio from Simli)
+    simliPc.addEventListener('track', (evt) => {
+      if (evt.track.kind === 'video') {
+        simliVideoEl.srcObject = evt.streams[0];
+        simliVideoEl.classList.add('active');
+        avatarStaticEl.style.display = 'none';
+        console.log('[Simli] Video track received — avatar visible');
+
+        simliVideoEl.requestVideoFrameCallback(() => {
+          console.log('[Simli] First video frame rendered');
+        });
+      } else if (evt.track.kind === 'audio') {
+        // Simli returns its own audio — we mute it since we play Cartesia audio via AudioWorklet
+        simliAudioEl.srcObject = evt.streams[0];
+        simliAudioEl.muted = true;
+        console.log('[Simli] Audio track received (muted — using Cartesia)');
+      }
+    });
+
+    // 5. Add receive-only transceivers
+    simliPc.addTransceiver('audio', { direction: 'recvonly' });
+    simliPc.addTransceiver('video', { direction: 'recvonly' });
+
+    // 6. Create offer
+    const offer = await simliPc.createOffer();
+    await simliPc.setLocalDescription(offer);
+
+    // 7. Wait for ICE candidates
+    await new Promise((resolve) => {
+      let candidateCount = 0;
+      let prevCount = -1;
+
+      const check = () => {
+        if (simliPc.iceGatheringState === 'complete' || candidateCount === prevCount) {
+          resolve();
+        } else {
+          prevCount = candidateCount;
+          setTimeout(check, 250);
+        }
+      };
+
+      simliPc.onicecandidate = (event) => {
+        if (event.candidate) candidateCount++;
+      };
+
+      setTimeout(check, 250);
+    });
+
+    console.log('[Simli] ICE gathering complete');
+
+    // 8. Connect signaling WebSocket
+    const wsUrl = `wss://api.simli.ai/compose/webrtc/p2p?session_token=${session_token}&enableSFU=true`;
+    simliWs = new WebSocket(wsUrl);
+    simliWs.binaryType = 'arraybuffer';
+
+    // Wait for WebSocket open, then send offer
+    await new Promise((resolve, reject) => {
+      simliWs.onopen = () => {
+        simliWs.send(JSON.stringify({
+          sdp: simliPc.localDescription.sdp,
+          type: simliPc.localDescription.type,
+        }));
+        console.log('[Simli] Offer sent via WebSocket');
+        resolve();
+      };
+      simliWs.onerror = (e) => reject(e);
+      setTimeout(() => reject(new Error('Simli WS timeout')), 10000);
+    });
+
+    // 9. Wait for answer
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Simli answer timeout')), 15000);
+
+      simliWs.addEventListener('message', async function handler(evt) {
+        if (typeof evt.data === 'string') {
+          if (evt.data === 'START') {
+            simliReady = true;
+            console.log('[Simli] ✅ Ready — sending initial silence');
+            // Send initial silence to activate avatar
+            const silence = new Uint8Array(64000);
+            simliWs.send(silence);
+            return;
+          }
+          if (evt.data === 'STOP') {
+            console.log('[Simli] Session ended by server');
+            simliReady = false;
+            return;
+          }
+          try {
+            const msg = JSON.parse(evt.data);
+            if (msg.type === 'answer') {
+              await simliPc.setRemoteDescription(msg);
+              console.log('[Simli] Remote description set');
+              clearTimeout(timeout);
+              resolve();
+            }
+          } catch (e) { /* not JSON, ignore */ }
+        }
+      });
+    });
+
+    console.log('[Simli] ✅ Avatar fully initialized');
+
+  } catch (err) {
+    console.error('[Simli] ❌ Init failed:', err.message);
+    console.log('[Simli] Falling back to static avatar');
+    // Static avatar already visible — no action needed
+  }
+}
+
+// ── Main WebSocket (PCM relay from server) ───────────────────────────────
+function connectWebSocket() {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = protocol + '//' + window.location.host + '/audio/' + sessionId + '?token=' + token;
+
+  console.log('[WS] Connecting to', wsUrl);
+  ws = new WebSocket(wsUrl);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    statusEl.textContent = 'Connected';
+    statusEl.className = 'status connected';
+    console.log('[WS] Connected');
+    if (audioCtx && audioCtx.state === 'suspended') {
+      audioCtx.resume();
+    }
+  };
+
+  ws.onmessage = (event) => {
+    if (event.data instanceof ArrayBuffer) {
+      // Binary: raw PCM s16le bytes at 48kHz from Cartesia
+      const pcmBytes = new Int16Array(event.data);
+
+      // Ensure AudioContext is running (Chrome may suspend it)
+      if (audioCtx && audioCtx.state !== 'running') {
+        audioCtx.resume().then(() => console.log('[Audio] AudioContext resumed'));
+      }
+
+      // 1. Send to AudioWorklet (48kHz playback — existing)
+      const float32 = new Float32Array(pcmBytes.length);
+      for (let i = 0; i < pcmBytes.length; i++) {
+        float32[i] = pcmBytes[i] / 32768.0;
+      }
+      if (workletNode) {
+        workletNode.port.postMessage({ type: 'pcm', samples: float32 });
+      }
+
+      // 2. Send to Simli (downsample to 16kHz)
+      if (simliEnabled) {
+        const pcm16k = downsample48to16(pcmBytes);
+        sendToSimli(pcm16k);
+      }
+
+    } else {
+      // Text: JSON control messages
+      try {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'stop') {
+          if (workletNode) {
+            workletNode.port.postMessage({ type: 'stop' });
+          }
+          avatarEl.classList.remove('speaking');
+          // Flush remaining audio to Simli
+          flushSimliBuffer();
+        } else if (msg.type === 'flush') {
+          if (workletNode) {
+            workletNode.port.postMessage({ type: 'flush' });
+          }
+        }
+      } catch (e) {
+        console.warn('[WS] Non-JSON text message:', event.data);
+      }
+    }
+  };
+
+  ws.onclose = () => {
+    statusEl.textContent = 'Disconnected';
+    statusEl.className = 'status';
+    console.log('[WS] Disconnected, reconnecting in 2s...');
+    reconnectTimer = setTimeout(connectWebSocket, 2000);
+  };
+
+  ws.onerror = (err) => {
+    console.error('[WS] Error:', err);
+    ws.close();
+  };
+}
+
+// ── Cleanup on page unload ───────────────────────────────────────────────
+window.addEventListener('beforeunload', () => {
+  if (simliWs && simliWs.readyState === WebSocket.OPEN) {
+    simliWs.send('DONE');
+    simliWs.close();
+  }
+  if (simliPc) {
+    simliPc.close();
+  }
+});
+
+// ── Init ─────────────────────────────────────────────────────────────────
+(async () => {
+  try {
+    await initAudio();
+    if (simliEnabled) {
+      // Start Simli init in parallel — don't block audio
+      initSimli().catch(e => console.error('[Simli] Background init error:', e));
+    }
+    if (sessionId) {
+      connectWebSocket();
+    } else {
+      statusEl.textContent = 'No session ID';
+    }
+  } catch (err) {
+    statusEl.textContent = 'Audio init failed: ' + err.message;
+    console.error('[Audio] Init failed:', err);
+  }
+})();
+</script>
+</body>
+</html>
