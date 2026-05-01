@@ -126,28 +126,36 @@ class GroqKeyRotator:
     # ── Configuration loading ───────────────────────────────────────────
 
     def _load_keys_from_env(self) -> list[str]:
-        """Load keys from env, preferring multi-key format."""
-        keys: list[str] = []
+        """Load keys from env, preferring multi-key format.
 
-        # New format: comma-separated list
+        Stage R: delegates to the shared key_rotator.load_keys() so all
+        services use the same env-var convention (GROQ_API_KEYS plural,
+        GROQ_API_KEY singular, plus legacy numbered variants if any).
+        Internal GroqRotator health tracking stays unchanged — we just
+        reuse the parsing logic.
+        """
+        try:
+            from key_rotator import load_keys as _kr_load_keys
+            return _kr_load_keys("GROQ")
+        except Exception:
+            pass
+
+        # Defensive fallback to legacy inline parsing if key_rotator import
+        # ever fails (e.g. circular import during early bootstrap).
+        keys: list[str] = []
         multi = os.environ.get("GROQ_API_KEYS", "").strip()
         if multi:
             keys = [k.strip() for k in multi.split(",") if k.strip()]
-
-        # Fallback: single key (backward-compatible)
         if not keys:
             single = os.environ.get("GROQ_API_KEY", "").strip()
             if single:
                 keys = [single]
-
-        # Dedupe while preserving order
         seen = set()
         unique = []
         for k in keys:
             if k not in seen:
                 seen.add(k)
                 unique.append(k)
-
         return unique
 
     # ── Public API ──────────────────────────────────────────────────────
