@@ -172,7 +172,7 @@ async def handle_start(request):
                 print(f"[Server] ⚠️  save_meeting_setup failed (non-fatal): {e}")
         await session.setup()
 
-        bot = RecallBot()
+        bot = RecallBot(session_id=session_id)
         bot_id = await bot.join(
             meeting_url, ws_url,
             audio_page_url=audio_page_url,
@@ -320,9 +320,20 @@ async def handle_jira_test(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
     try:
         from external_apis import JiraClient
-        jira = JiraClient()
+        # Read credentials from POST body (UI form). If body is empty or
+        # missing fields, JiraClient falls back to env vars per field.
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        jira = JiraClient(
+            base_url=body.get("base_url"),
+            email=body.get("email"),
+            token=body.get("token"),
+            project=body.get("project"),
+        )
         if not jira.enabled:
-            return web.json_response({"ok": False, "error": "Not configured"})
+            return web.json_response({"ok": False, "error": "Not configured (need base_url, email, and token)"})
         ok = await jira.test_connection()
         await jira.close()
         return web.json_response({"ok": ok, "message": f"Connected to {jira.base_url}" if ok else "Failed"})
@@ -336,7 +347,18 @@ async def handle_jira_projects(request):
         return web.json_response({"error": "Unauthorized"}, status=401)
     try:
         from external_apis import JiraClient
-        jira = JiraClient()
+        # If the UI POSTs credentials, use them. Otherwise (legacy GET, or
+        # POST with empty body) fall through to env vars.
+        try:
+            body = await request.json() if request.method == "POST" else {}
+        except Exception:
+            body = {}
+        jira = JiraClient(
+            base_url=body.get("base_url"),
+            email=body.get("email"),
+            token=body.get("token"),
+            project=body.get("project"),
+        )
         projects = await jira.get_projects() if jira.enabled else []
         await jira.close()
         return web.json_response({"projects": projects})
@@ -650,6 +672,510 @@ async def handle_commitments(request):
         return web.json_response({"commitments": [], "error": str(e)})
 
 
+def _clean_profile_markdown(text: str) -> str:
+    """Strip markdown formatting and inline citations from a profile string.
+
+    Google AI Mode often returns reconstructed_markdown with:
+      - Inline links: [text](url)
+      - Headers: ### Heading (sometimes mid-line)
+      - Bullets: - item (sometimes mid-line)
+      - Citation markers: [0], [1], [^1]
+      - A trailing "### References" section
+      - Backslash-escaped chars: \\-, \\(, \\)
+
+    The text often arrives as a single long line with `###` and `-` markers
+    embedded mid-string, so we first split on those markers to give the
+    line-based regexes something to work with.
+
+    Voice/UI use needs plain prose — no markdown, no URLs. This converts to
+    natural readable text suitable for both display in the textarea and
+    injection into Sam's system prompt.
+
+    Idempotent: running twice is safe (does nothing on the second pass).
+    """
+    import re as _re_local
+
+    if not text:
+        return ""
+    s = text
+
+    # 1. Drop trailing References section (everything from "### References"
+    #    or "References:" on, regardless of whether it's at line start)
+    s = _re_local.sub(
+        r"\s*#{1,6}\s*References\b.*$",
+        "",
+        s,
+        flags=_re_local.IGNORECASE | _re_local.DOTALL,
+    )
+    s = _re_local.sub(
+        r"\s*\bReferences\s*:.*$",
+        "",
+        s,
+        flags=_re_local.IGNORECASE | _re_local.DOTALL,
+    )
+
+    # 2. Convert inline markdown links [text](url) → just "text"
+    s = _re_local.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)
+
+    # 3. Drop bare citation markers like [0], [12], [^3]
+    s = _re_local.sub(r"\[\^?\d+\]", "", s)
+
+    # 4. Insert paragraph break BEFORE every "### Heading" marker, then
+    #    strip the marker. This handles mid-line headers gracefully.
+    s = _re_local.sub(r"\s*#{1,6}\s+", "\n\n", s)
+
+    # 5. Insert sentence break BEFORE every " - Bullet" marker (mid-line
+    #    bullets common in Google's reconstructed_markdown), then strip.
+    #    Only matches when preceded by space/period (not start of word).
+    s = _re_local.sub(r"(?:^|\s)[-*•]\s+", " ", s)
+
+    # 6. Strip remaining bold/italic markers
+    s = _re_local.sub(r"\*\*([^*]+)\*\*", r"\1", s)
+    s = _re_local.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", s)
+
+    # 7. Drop "Field name:" labels that came from bulleted lists
+    #    "Role & Expertise: He is..." → "He is..."
+    #    Carefully limited to short capitalized labels at sentence boundaries
+    s = _re_local.sub(
+        r"(^|\.\s+|\n\n)([A-Z][A-Za-z0-9 &/()+\-]{2,40}):\s+",
+        r"\1",
+        s,
+    )
+
+    # 8. Unescape common backslash-escaped punctuation
+    s = s.replace("\\(", "(").replace("\\)", ")")
+    s = s.replace("\\-", "-").replace("\\+", "+")
+    s = s.replace("\\&", "&").replace("\\.", ".")
+    s = s.replace("\\,", ",").replace("\\:", ":")
+    s = s.replace("\\|", "|")
+
+    # 9. Collapse excess whitespace, normalize line breaks
+    s = "\n".join(line.strip() for line in s.split("\n"))
+    s = _re_local.sub(r"\n{2,}", "\n\n", s)
+
+    # 10. Within paragraphs, single newline → space (so flowing prose isn't
+    #     awkwardly split). Preserve double newlines as paragraph breaks.
+    paragraphs = s.split("\n\n")
+    paragraphs = [_re_local.sub(r"\s*\n\s*", " ", p).strip() for p in paragraphs]
+    paragraphs = [p for p in paragraphs if p]
+    s = "\n\n".join(paragraphs)
+
+    # 11. Final whitespace cleanup
+    s = _re_local.sub(r"[ \t]{2,}", " ", s).strip()
+
+    return s
+
+
+async def handle_clients_research(request):
+    """POST /api/clients/research — fetch a client/company profile via SerpAPI.
+
+    Body: {"client_names": "alice, bob", "company_names": "Acme, Foo Inc"}
+
+    Strategy (3 layers, in order):
+
+    1. SerpAPI Google AI Mode WITH GEO GROUNDING (gl/hl/location). This is
+       the critical fix: Google AI Mode behaves differently per region.
+       Without these params, SerpAPI's US servers hit a variant of AI Mode
+       that often skips synthesis for non-US entities (e.g. AnavClouds, an
+       India-based company) and returns only citations. With "in" + "India"
+       defaults, Google treats it as a local search and synthesizes properly.
+
+       Configurable via env: SERPAPI_GL, SERPAPI_HL, SERPAPI_LOCATION.
+       Uses a SHORT natural query — AI Mode synthesizes more reliably for
+       natural questions than for multi-paragraph structured instructions.
+       Retries up to 3 times because AI Mode is non-deterministic.
+
+    2. If all 3 retries return references-only, hand the citation snippets
+       to Azure gpt-4o-mini and have it write a coherent profile FROM those
+       grounded sources. This is true LLM synthesis, not stitching, and
+       it's grounded in real Google citations so factuality is preserved.
+
+    3. If even Azure fails, return an honest warning + diagnostic so the
+       user can write the profile manually.
+    """
+    user = _get_user(request)
+    if not user:
+        return web.json_response({"error": "Unauthorized"}, status=401)
+    try:
+        data = await request.json()
+    except Exception:
+        return web.json_response({"error": "Invalid JSON"}, status=400)
+
+    client_names = (data.get("client_names") or "").strip()
+    company_names = (data.get("company_names") or "").strip()
+
+    if not client_names and not company_names:
+        return web.json_response(
+            {"error": "Please provide at least one client name or company name"},
+            status=400,
+        )
+    if len(client_names) > 500 or len(company_names) > 500:
+        return web.json_response(
+            {"error": "Input too long (500 char max per field)"},
+            status=400,
+        )
+
+    # SHORT natural query — Google AI Mode synthesizes reliably for natural
+    # questions. The detailed structure (2-3 sentences each, factual, etc.)
+    # is moved to the Azure synthesis prompt at step 2 instead.
+    parts = ["Tell me about"]
+    if client_names:
+        parts.append(client_names)
+        if company_names:
+            parts.append("from")
+            parts.append(company_names)
+    elif company_names:
+        parts.append(company_names)
+    parts.append("— who they are, what they do, and notable work.")
+    short_query = " ".join(parts)
+
+    # Detailed instructions reused for the Azure synthesis fallback step
+    detailed_instructions = (
+        "For each person, write 2-3 sentences covering their professional "
+        "role, their connection to the company, and any notable public work "
+        "or projects. For each company, write 2-3 sentences covering what "
+        "the company does, founding year/location/scale, and notable "
+        "initiatives. Keep it factual and concise. Plain readable prose only "
+        "— no URLs, no citations, no markdown bullets, no headers. Maximum "
+        "250 words total. If a specific person or company cannot be reliably "
+        "identified from the source material below, say so explicitly — do "
+        "not guess or invent details."
+    )
+
+    try:
+        import httpx
+        import json as _json
+        import time as _time
+
+        # Pick a SerpAPI key via the shared rotator. Handles all three env
+        # var formats: SERPAPI_KEYS (plural, comma-separated — Stage R),
+        # SERPAPI_KEY (singular), and legacy SERPAPI_KEY_1..N.
+        from key_rotator import key_for_request
+        serp_key = key_for_request("SERPAPI") or ""
+        if not serp_key:
+            return web.json_response({
+                "error": "SerpAPI not configured (set SERPAPI_KEYS in your .env)"
+            }, status=500)
+
+        # Geo grounding params — control where Google AI Mode "thinks it is".
+        # Defaults to India because most current clients are India-based.
+        # Override via env vars if your typical clients are elsewhere.
+        gl_param = (os.environ.get("SERPAPI_GL") or "in").strip()
+        hl_param = (os.environ.get("SERPAPI_HL") or "en").strip()
+        location_param = (os.environ.get("SERPAPI_LOCATION") or "India").strip()
+
+        print(f"[ClientsResearch] === Starting research ===")
+        print(f"[ClientsResearch] Query: \"{short_query}\"")
+        print(f"[ClientsResearch] Geo: gl={gl_param}, hl={hl_param}, location={location_param}")
+
+        # ── STAGE 1: Try SerpAPI Google AI Mode up to 3 times ──
+        attempts = []
+        synthesized_text = ""
+        extraction_strategy = "none"
+        latest_references = []
+        latest_top_keys = []
+        debug_files = []
+        total_ms = 0
+
+        for attempt_num in range(1, 4):
+            t0 = _time.time()
+            params = {
+                "engine": "google_ai_mode",
+                "q": short_query,
+                "api_key": serp_key,
+                # Location/language params help AI Mode ground properly.
+                # Without these, SerpAPI's US servers can hit a variant of
+                # AI Mode that skips grounding and just returns citations.
+                "gl": gl_param,
+                "hl": hl_param,
+                "location": location_param,
+            }
+
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.get(
+                        "https://serpapi.com/search.json", params=params)
+            except httpx.TimeoutException:
+                attempts.append({"attempt": attempt_num, "outcome": "timeout"})
+                print(f"[ClientsResearch] Attempt {attempt_num}: TIMEOUT")
+                continue
+
+            ms = (_time.time() - t0) * 1000
+            total_ms += ms
+
+            if resp.status_code != 200:
+                attempts.append({
+                    "attempt": attempt_num,
+                    "outcome": f"http_{resp.status_code}",
+                    "ms": int(ms),
+                })
+                print(f"[ClientsResearch] Attempt {attempt_num}: "
+                      f"HTTP {resp.status_code} after {ms:.0f}ms")
+                continue
+
+            try:
+                raw_data = resp.json()
+            except Exception:
+                attempts.append({"attempt": attempt_num, "outcome": "invalid_json"})
+                continue
+
+            # Save full response per attempt for inspection
+            try:
+                ts_str = _time.strftime("%Y%m%d-%H%M%S")
+                debug_dir = "serpapi_debug"
+                os.makedirs(debug_dir, exist_ok=True)
+                debug_file = os.path.join(
+                    debug_dir, f"clients_{ts_str}_a{attempt_num}.json")
+                with open(debug_file, "w", encoding="utf-8") as f:
+                    _json.dump({
+                        "query": short_query,
+                        "geo": {"gl": gl_param, "hl": hl_param,
+                                "location": location_param},
+                        "response": raw_data,
+                    }, f, indent=2, ensure_ascii=False)
+                debug_files.append(debug_file)
+                print(f"[ClientsResearch] Attempt {attempt_num}: 💾 {debug_file}")
+            except Exception:
+                pass
+
+            meta = raw_data.get("search_metadata", {}) or {}
+            status = meta.get("status", "?")
+            top_keys = [k for k in raw_data.keys()
+                        if k not in ("search_metadata", "search_parameters")]
+            latest_top_keys = top_keys
+            latest_references = raw_data.get("references", []) or []
+
+            print(f"[ClientsResearch] Attempt {attempt_num}: "
+                  f"status={status}, fields={top_keys}, ms={ms:.0f}")
+
+            if status != "Success":
+                attempts.append({
+                    "attempt": attempt_num,
+                    "outcome": f"status_{status}",
+                    "ms": int(ms),
+                })
+                continue
+
+            # Try to extract synthesis — markdown first, then text_blocks
+            recon = raw_data.get("reconstructed_markdown", "") or ""
+            if recon and recon.strip():
+                synthesized_text = recon.strip()
+                extraction_strategy = "reconstructed_markdown"
+                attempts.append({
+                    "attempt": attempt_num,
+                    "outcome": "synthesized_via_markdown",
+                    "ms": int(ms),
+                })
+                print(f"[ClientsResearch] ✅ Attempt {attempt_num} synthesized "
+                      f"({len(synthesized_text)} chars via markdown)")
+                break
+
+            text_blocks = raw_data.get("text_blocks", []) or []
+            if text_blocks:
+                tb_parts = []
+                for b in text_blocks:
+                    if not isinstance(b, dict):
+                        continue
+                    snip = (b.get("snippet") or b.get("text") or "").strip()
+                    if snip:
+                        tb_parts.append(snip)
+                    for it in (b.get("list") or []):
+                        if isinstance(it, dict):
+                            it_snip = (it.get("snippet") or it.get("text") or "").strip()
+                            if it_snip:
+                                tb_parts.append(it_snip)
+                if tb_parts:
+                    synthesized_text = " ".join(tb_parts).strip()
+                    extraction_strategy = "text_blocks"
+                    attempts.append({
+                        "attempt": attempt_num,
+                        "outcome": "synthesized_via_text_blocks",
+                        "ms": int(ms),
+                    })
+                    print(f"[ClientsResearch] ✅ Attempt {attempt_num} synthesized "
+                          f"({len(synthesized_text)} chars via text_blocks)")
+                    break
+
+            # No synthesis on this attempt — try again
+            attempts.append({
+                "attempt": attempt_num,
+                "outcome": "references_only",
+                "ms": int(ms),
+                "ref_count": len(latest_references),
+            })
+            print(f"[ClientsResearch] Attempt {attempt_num}: only references "
+                  f"({len(latest_references)} citations) — retrying")
+
+        # ── STAGE 2: Azure synthesis from reference snippets ──
+        # Real LLM synthesis (NOT stitching) using Google's citations as
+        # source material. Output is grounded in real citations so factuality
+        # is preserved.
+        used_azure_fallback = False
+        if not synthesized_text and latest_references:
+            print(f"[ClientsResearch] No synthesis after 3 attempts — "
+                  f"falling back to Azure synthesis from "
+                  f"{len(latest_references)} references")
+
+            ref_lines = []
+            for r in latest_references[:9]:
+                if not isinstance(r, dict):
+                    continue
+                title = (r.get("title") or "").strip()
+                src = (r.get("source") or "").strip()
+                snip = (r.get("snippet") or "").strip()
+                if snip:
+                    if title:
+                        ref_lines.append(f"- {title} ({src}): {snip}")
+                    else:
+                        ref_lines.append(f"- {snip}")
+            ref_block = "\n".join(ref_lines)
+
+            azure_endpoint = (os.environ.get("AZURE_ENDPOINT", "") or "").strip().rstrip("/")
+            azure_key = (os.environ.get("AZURE_API_KEY", "") or "").strip()
+            azure_deployment = (os.environ.get("AZURE_DEPLOYMENT", "gpt-4o-mini") or "").strip()
+            azure_api_version = (os.environ.get("AZURE_API_VERSION", "2024-02-15-preview") or "").strip()
+
+            if azure_endpoint and azure_key and ref_block:
+                synth_system = (
+                    "You write factual profile summaries. The user gives you "
+                    "raw search citations from Google. You write a clean "
+                    "natural-prose summary based ONLY on what those citations "
+                    "say — never invent details, never hallucinate dates or "
+                    "numbers. If the citations don't cover something, leave "
+                    "it out. Output plain prose only — no bullets, no "
+                    "headers, no URLs, no citation markers like [1]."
+                )
+                synth_user = (
+                    f"{detailed_instructions}\n\n"
+                    f"Source material (Google search citations):\n{ref_block}\n\n"
+                    f"Now write the profile."
+                )
+
+                url = (f"{azure_endpoint}/openai/deployments/{azure_deployment}"
+                       f"/chat/completions?api-version={azure_api_version}")
+                try:
+                    t_az = _time.time()
+                    async with httpx.AsyncClient(timeout=30.0) as ac:
+                        ar = await ac.post(
+                            url,
+                            headers={"api-key": azure_key,
+                                     "Content-Type": "application/json"},
+                            json={
+                                "messages": [
+                                    {"role": "system", "content": synth_system},
+                                    {"role": "user", "content": synth_user},
+                                ],
+                                "temperature": 0.3,
+                                "max_tokens": 500,
+                            },
+                        )
+                    az_ms = (_time.time() - t_az) * 1000
+                    if ar.status_code == 200:
+                        adata = ar.json()
+                        synth = ((adata.get("choices") or [{}])[0]
+                                 .get("message", {}).get("content", "") or "").strip()
+                        if synth:
+                            synthesized_text = synth
+                            extraction_strategy = "azure_synthesis_from_references"
+                            used_azure_fallback = True
+                            print(f"[ClientsResearch] ✅ Azure synthesis "
+                                  f"({len(synth)} chars in {az_ms:.0f}ms)")
+                    else:
+                        print(f"[ClientsResearch] ⚠️ Azure HTTP {ar.status_code}")
+                except Exception as e:
+                    print(f"[ClientsResearch] ⚠️ Azure call failed: "
+                          f"{type(e).__name__}: {e}")
+            else:
+                print(f"[ClientsResearch] ⚠️ Azure not configured "
+                      f"(endpoint={bool(azure_endpoint)}, "
+                      f"key={bool(azure_key)}, refs={bool(ref_block)})")
+
+        # ── STAGE 3: Honest failure with diagnostics ──
+        if not synthesized_text:
+            ref_count = len(latest_references)
+            return web.json_response({
+                "profile_text": "",
+                "word_count": 0,
+                "warning": (
+                    f"Google AI Mode did not synthesize an answer "
+                    f"(returned only {ref_count} citation references "
+                    f"across {len(attempts)} attempts) and Azure "
+                    f"fallback also failed. Try a more specific query "
+                    f"(add location, sector) or write the profile manually."
+                ),
+                "diagnostic": {
+                    "top_keys": latest_top_keys,
+                    "extraction_strategy": "none",
+                    "latency_ms": int(total_ms),
+                    "reference_count": ref_count,
+                    "attempts": attempts,
+                    "debug_files": debug_files,
+                },
+            })
+
+        # Clean markdown/links/headers/citations regardless of which path
+        # produced the text (markdown / text_blocks / Azure synthesis).
+        # Sam needs plain prose — markdown URLs and reference markers would
+        # confuse both the TTS and the Agent.
+        synthesized_text = _clean_profile_markdown(synthesized_text)
+
+        # Stage 2.13 + 2.14: structured profile header.
+        # Stage 2.14: drop misleading client-on-call line.
+        # The "Client names" field in the UI is a research pivot — the user
+        # types a public-facing person at the company (e.g. an executive,
+        # founder, or named figure) so SerpAPI can find the RIGHT company
+        # among many with similar names. That person is NOT necessarily on
+        # the call. The actual speaker is whoever joins the meeting in
+        # Recall.ai — a different layer entirely.
+        #
+        # Stage 2.13 wrongly assumed client_names = attendees and added a
+        # "CLIENT(S) ON THE CALL: <client_names>" line. That made Sam
+        # confidently mis-identify the speaker. We removed that line.
+        #
+        # What remains: just the COMPANY: line (clean string Sam can extract)
+        # and a clarifying KEY FACTS line saying the prose is ABOUT THE
+        # COMPANY, not the speaker. Names mentioned IN the prose (founders,
+        # executives, public figures used as research anchors) are explicitly
+        # not assumed to be on the call.
+        header_lines = []
+        if company_names:
+            header_lines.append(f"COMPANY: {company_names}")
+        if header_lines:
+            header_lines.append(
+                "KEY FACTS BELOW (this describes the speaker's company — "
+                "use it to ground your answers about their business. Names "
+                "mentioned in the description, e.g. founders or executives, "
+                "are research references and are NOT necessarily on the call):"
+            )
+            structured_header = "\n".join(header_lines)
+            synthesized_text = structured_header + "\n\n" + synthesized_text
+
+        # Cap at 300 words (after header prepend so total length is bounded)
+        words = synthesized_text.split()
+        if len(words) > 300:
+            synthesized_text = " ".join(words[:300]) + "..."
+
+        return web.json_response({
+            "profile_text": synthesized_text,
+            "word_count": min(len(words), 300),
+            "diagnostic": {
+                "top_keys": latest_top_keys,
+                "extraction_strategy": extraction_strategy,
+                "latency_ms": int(total_ms),
+                "attempts": attempts,
+                "debug_files": debug_files,
+                "used_azure_fallback": used_azure_fallback,
+                "reference_count": len(latest_references),
+            },
+        })
+
+    except httpx.TimeoutException:
+        return web.json_response({"error": "Request timed out"}, status=504)
+    except Exception as e:
+        print(f"[ClientsResearch] ⚠️ Failed: {type(e).__name__}: {e}")
+        return web.json_response({"error": f"Research failed: {e}"}, status=500)
+
+
 async def main():
     global active_server
     server = WebSocketServer(port=PORT)
@@ -675,7 +1201,8 @@ async def main():
         ("GET", "/api/settings", handle_settings_get),
         ("POST", "/api/settings/save", handle_settings_save),
         ("POST", "/api/settings/jira/test", handle_jira_test),
-        ("GET", "/api/jira/projects", handle_jira_projects),
+        ("GET",  "/api/jira/projects", handle_jira_projects),
+        ("POST", "/api/jira/projects", handle_jira_projects),
         ("GET", "/api/jira/sprints", handle_jira_sprints),
         ("GET", "/api/pending", handle_pending_get),
         ("POST", "/api/pending/sync", handle_pending_sync),
@@ -692,6 +1219,8 @@ async def main():
         ("GET", "/api/dialogue_state/{session_id}", handle_dialogue_state),
         # Phase 6 step 1: commitments visibility
         ("GET", "/api/commitments/{session_id}", handle_commitments),
+        # Client research (Know About Them) — SerpAPI Google AI Mode profile fetch
+        ("POST", "/api/clients/research", handle_clients_research),
         ("GET", "/audio-page", handle_audio_page),
         ("GET", "/", handle_index),
     ]
