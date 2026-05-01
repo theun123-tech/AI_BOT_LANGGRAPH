@@ -134,9 +134,26 @@ Extract the following. Respond with JSON only — no commentary, no markdown fen
    Otherwise false.
 
 5. scope_signal — is this utterance touching out-of-scope territory?
-   Return "out_of_scope" if the utterance references any item in scope_out.
-   Return "in_scope" if it's clearly within scope_in.
-   Return "unclear" otherwise.
+   Return "out_of_scope" ONLY when the utterance EXPLICITLY mentions one
+   of the specific topics listed in `Out-of-scope topics` above. The match
+   must be on the actual subject matter — not just any off-topic question.
+   Synonyms and obvious paraphrases of those listed topics also count
+   (e.g. "compensation" matches scope_out item "salary").
+
+   IMPORTANT: An utterance that is simply unrelated to the agenda but does
+   NOT mention any listed scope_out item is NOT out_of_scope. Random off-
+   topic questions (general knowledge, world events, the weather, asking
+   about the bot itself, etc.) should be marked "unclear" or "in_scope",
+   never "out_of_scope". The scope_out list is the ONLY source of truth
+   for what counts as out-of-scope.
+
+   If `Out-of-scope topics` is "(nothing excluded)", NEVER return
+   "out_of_scope" — return "in_scope" or "unclear" instead.
+
+   Return "in_scope" if the utterance is clearly within scope_in or on
+   the active agenda.
+   Return "unclear" otherwise (including for off-topic-but-not-listed
+   utterances).
 
 6. topic_signal — is the speaker managing the meeting flow?
    - "moving_on"       — wants to go to next topic ("let's move on", "next topic", "what else")
@@ -274,6 +291,34 @@ Output:
   "scope_signal": "out_of_scope",
   "topic_signal": "none",
   "reasoning": "Grants tracking is listed as out-of-scope for this meeting"
+}}
+
+Example 7b — Off-topic but NOT a listed scope_out item:
+Context: scope_out = "hiring, salary, grants tracking, personal leave"
+Input: "Who is the president of the USA?"
+Output:
+{{
+  "intent": "question",
+  "entities": [],
+  "commitment": null,
+  "freshness_hint": false,
+  "scope_signal": "unclear",
+  "topic_signal": "none",
+  "reasoning": "Question is unrelated to the agenda but does not mention any listed scope_out item — not a scope violation"
+}}
+
+Example 7c — Off-topic question, no scope_out list configured:
+Context: scope_out = "(nothing excluded)"
+Input: "What's the weather in Mumbai?"
+Output:
+{{
+  "intent": "question",
+  "entities": [],
+  "commitment": null,
+  "freshness_hint": false,
+  "scope_signal": "unclear",
+  "topic_signal": "none",
+  "reasoning": "Off-topic question, but scope_out is empty so nothing is formally out of scope"
 }}
 
 Example 8 — Topic close:
@@ -490,7 +535,7 @@ def build_nlu_prompt(
     else:
         history_str = "  (no prior turns)"
 
-    return NLU_PROMPT.format(
+    rendered = NLU_PROMPT.format(
         agenda_list=agenda_str,
         scope_in=scope_in_str,
         scope_out=scope_out_str,
@@ -502,6 +547,41 @@ def build_nlu_prompt(
         speaker=speaker,
         user_text=user_text.replace('"', "'"),  # avoid breaking the JSON template
     )
+
+    # ── Debug dump (opt-out via NLU_DEBUG_DUMP=0) ─────────────────────────
+    # Appends every rendered NLU prompt to nlu_debug.txt with a timestamped
+    # header. Lets you inspect EXACTLY what the model is seeing when it
+    # makes scope_signal / intent decisions. Especially useful for
+    # diagnosing "why did NLU say out_of_scope here?" without re-running.
+    # File grows append-only — rotate/delete as needed.
+    import os as _os
+    if _os.environ.get("NLU_DEBUG_DUMP", "1") != "0":
+        try:
+            import datetime as _dt
+            ts_str = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            sep = "═" * 70
+            header = (
+                f"\n{sep}\n"
+                f"NLU CALL @ {ts_str}\n"
+                f"speaker         : {speaker}\n"
+                f"user_text       : {user_text!r}\n"
+                f"scope_out_input : {scope_out!r}\n"
+                f"scope_in_input  : {scope_in!r}\n"
+                f"agenda          : {agenda_titles!r}\n"
+                f"current_topic   : {current_topic!r}\n"
+                f"{sep}\n"
+                f"--- RENDERED PROMPT ---\n"
+            )
+            footer = f"\n--- END PROMPT ({len(rendered)} chars) ---\n"
+            with open("nlu_debug.txt", "a", encoding="utf-8") as f:
+                f.write(header)
+                f.write(rendered)
+                f.write(footer)
+        except Exception as _dbg_err:
+            # Never let debug dumping break the NLU call
+            print(f"[NLU] ⚠️  debug dump failed (non-fatal): {_dbg_err}")
+
+    return rendered
 
 ###########################################################################
 # ─── MEETING STATE SCHEMA  (was: meeting_state.py)
@@ -877,6 +957,16 @@ class MeetingState(TypedDict, total=False):
     scope_deviations: Annotated[list[ScopeDeviation], append_list]
     """Log of times user brought up out-of-scope content and how Sam handled it."""
 
+    # ── Client profile (1 field) ───────────────────────────────────────────
+    client_profile: Annotated[str, replace_value]
+    """Free-text client/company profile from the 'Know About Them' UI feature.
+    Used by all synthesis prompts to ground company-fact answers (e.g. who is
+    the CEO, what do we do). Empty string when not configured. Read by:
+    - websocket_server._build_client_profile_block_for_prompt()
+    - Agent._get_client_profile_block()
+    - Agent._format_meeting_state()
+    Set once at DialogueManager.initialize() and unchanged for the session."""
+
     # ── Commitments (3 fields) ─────────────────────────────────────────────
     commitments_open: Annotated[list[Commitment], replace_value]
     """Action items pending. Updated on every turn — use replace to allow removal."""
@@ -956,11 +1046,17 @@ def create_initial_state(
     prior_meeting_summaries: list[PriorMeetingSummary] | None = None,
     commitments_inherited: list[Commitment] | None = None,
     planned_duration_minutes: int = 30,
+    client_profile: str = "",
 ) -> MeetingState:
     """Build a fully-initialized MeetingState with sensible defaults.
 
-    Use this at session start — it guarantees all 25 fields are present with
+    Use this at session start — it guarantees all 26 fields are present with
     safe defaults so downstream nodes never hit KeyError.
+
+    Args:
+        client_profile: Free-text profile from the "Know About Them" UI feature.
+            Injected into every synthesis prompt so Sam can ground company-fact
+            answers (CEO, services, etc.). Empty string when not configured.
     """
     return MeetingState(
         # Agenda
@@ -972,6 +1068,8 @@ def create_initial_state(
         scope_in=scope_in or [],
         scope_out=scope_out or [],
         scope_deviations=[],
+        # Client profile (from UI "Know About Them")
+        client_profile=client_profile or "",
         # Commitments
         commitments_open=[],
         commitments_resolved=[],
@@ -1035,6 +1133,8 @@ def state_to_json(state: MeetingState) -> dict:
         "scope_in": list(state.get("scope_in", [])),
         "scope_out": list(state.get("scope_out", [])),
         "scope_deviations": _serialize_list(state.get("scope_deviations", []), lambda x: x.to_dict()),
+        # Client profile (from UI "Know About Them")
+        "client_profile": state.get("client_profile", "") or "",
         # Commitments
         "commitments_open": _serialize_list(state.get("commitments_open", []), lambda x: x.to_dict()),
         "commitments_resolved": _serialize_list(state.get("commitments_resolved", []), lambda x: x.to_dict()),
@@ -1083,6 +1183,8 @@ def state_from_json(data: dict) -> MeetingState:
         scope_in=list(data.get("scope_in", [])),
         scope_out=list(data.get("scope_out", [])),
         scope_deviations=[ScopeDeviation.from_dict(x) for x in data.get("scope_deviations", [])],
+        # Client profile (from UI "Know About Them")
+        client_profile=data.get("client_profile", "") or "",
         # Commitments
         commitments_open=[Commitment.from_dict(x) for x in data.get("commitments_open", [])],
         commitments_resolved=[Commitment.from_dict(x) for x in data.get("commitments_resolved", [])],
@@ -2815,16 +2917,8 @@ class DialogueManager:
         # Track pending background persist tasks so close() can await them
         self._pending_persists: list[asyncio.Task] = []
 
-        # Track pending NLU background tasks (fire-and-forget) so close() awaits them
-        self._pending_nlu_tasks: list[asyncio.Task] = []
-
         # Async lock to serialize turns (prevents race when two turns arrive quickly)
         self._turn_lock = asyncio.Lock()
-
-        # Serializes NLU state updates across background tasks.
-        # NLU for turn N+1 may finish before NLU for turn N in rare cases;
-        # the lock prevents state corruption from concurrent writes.
-        self._nlu_serial_lock = asyncio.Lock()
 
         # NLU analyzer (Azure primary, Groq fallback). Heavy but reusable.
         self._nlu_analyzer = NLUAnalyzer(tag=tag)
@@ -2844,8 +2938,16 @@ class DialogueManager:
         prior_meeting_summaries: Optional[list] = None,
         commitments_inherited: Optional[list] = None,
         planned_duration_minutes: int = 30,
+        client_profile: str = "",
     ) -> None:
-        """Build initial state + compile the LangGraph."""
+        """Build initial state + compile the LangGraph.
+
+        Args:
+            client_profile: Free-text profile from the "Know About Them" UI feature.
+                Stored in MeetingState so all synthesis prompts (legacy research,
+                Exa research, fast PM, fast cached) can ground company-fact answers
+                (CEO name, what we do, etc.). Empty string when not configured.
+        """
         if self._initialized:
             return
 
@@ -2859,6 +2961,7 @@ class DialogueManager:
             prior_meeting_summaries=prior_meeting_summaries or [],
             commitments_inherited=commitments_inherited or [],
             planned_duration_minutes=planned_duration_minutes,
+            client_profile=client_profile or "",
         )
 
         self._graph = self._build_graph()
@@ -2867,9 +2970,11 @@ class DialogueManager:
         agenda_count = len(self._state.get("agenda", []))
         ticket_count = len(self._state.get("pre_loaded_tickets", {}))
         prior_count = len(self._state.get("prior_meeting_summaries", []))
+        cp_len = len(self._state.get("client_profile", "") or "")
 
         print(f"[DialogueManager] {self._tag} 🧠 Initialized "
-              f"(agenda={agenda_count}, tickets={ticket_count}, prior={prior_count})")
+              f"(agenda={agenda_count}, tickets={ticket_count}, "
+              f"prior={prior_count}, client_profile={cp_len} chars)")
 
     def _build_graph(self) -> Any:
         """Construct the LangGraph StateGraph.
@@ -2896,336 +3001,54 @@ class DialogueManager:
     # ── Public API: turn processing ─────────────────────────────────────
 
     async def process_turn(self, text: str, speaker: str) -> None:
-        """Process a user turn with TRULY PARALLEL NLU (fire-and-forget).
+        """Process a user turn through the graph.
 
-        ── FIXED PARALLEL FLOW (returns in ~5ms) ──────────────────────
-        1. Compute fast-path decision via regex/heuristics (~1ms)
-        2. Publish fast-path decision (caller can read via get_last_decision)
-        3. Fire agent_callback synchronously (no-op in observer mode)
-        4. Fire NLU + Policy as TRULY FIRE-AND-FORGET background task
-        5. Return immediately — caller's await unblocks in ~5ms
-        ──────────────────────────────────────────────────────────────
+        This is called by BotSession when:
+            - AddresseeDecider decides Sam should respond, OR
+            - (Option A) any turn happens, even if Sam stays silent
 
-        Critical fix vs previous version: we do NOT await the NLU task.
-        The caller (_run_dialogue_manager_observer in websocket_server.py)
-        reads get_last_decision() right after process_turn returns, and
-        fires the driver. If we awaited NLU, the driver was delayed by
-        600-3000ms every turn — defeating the whole point.
-
-        NLU still runs — just in the background. Its state updates
-        (commitments, tickets_referenced, conversation_turns) are
-        applied when NLU completes, serialized via _nlu_serial_lock.
+        Graph runs, state gets updated, Agent may be triggered for response.
         """
         if self._closed or not self._initialized:
             print(f"[DialogueManager] {self._tag} ⚠️  process_turn called but not initialized/closed")
             return
 
-        turn_start = time.monotonic()
-
-        # ── CRITICAL SECTION: fast-path only (held briefly) ─────────────
         async with self._turn_lock:
             self._turn_counter += 1
             turn_num = self._turn_counter
 
-            # Capture turn data — passed by value to the NLU task so it
-            # doesn't rely on self._pending_turn (which gets overwritten
-            # by the next turn).
-            turn_data = {
+            # Set transient pending-turn state (nodes read via self._pending_turn).
+            # Can't pass this through graph state — LangGraph strips unknown fields.
+            self._pending_turn = {
                 "turn_number": turn_num,
                 "speaker": speaker,
                 "text": text,
                 "timestamp": time.time(),
             }
-            self._pending_turn = turn_data
+            # Reset pending NLU/decision for this turn
+            self._pending_nlu = None
+            self._pending_decision = None
 
-            # Compute fast-path decision (~1ms regex/heuristics)
-            fast_decision = self._fast_path_decision(text, speaker)
-            self._pending_decision = fast_decision
-            self._last_committed_decision = fast_decision
+            # Graph input is just the current state snapshot
+            graph_input: dict[str, Any] = dict(self._state)
 
-            # Snapshot state for background tasks (NLU reads from snapshot,
-            # applies updates via _nlu_serial_lock so there's no race)
-            state_snapshot: dict[str, Any] = dict(self._state)
+            try:
+                result = await self._graph.ainvoke(graph_input)
+                # Merge result back into live state
+                self._state = dict(result)
 
-        fast_ms = int((time.monotonic() - turn_start) * 1000)
-        print(f"[DialogueManager] {self._tag} ⚡ fast-path ({fast_ms}ms): "
-              f"{fast_decision.action.value} "
-              f"(conf={fast_decision.confidence:.2f}) "
-              f"— NLU dispatched to background")
+                print(f"[DialogueManager] {self._tag} ✅ Turn {turn_num} processed | "
+                      f"{state_summary_for_logging(self._state)}")
 
-        # ── Fire agent_callback synchronously ────────────────────────
-        # In observer mode this is a no-op (logs 'suppressed', returns).
-        # In driver mode this may kick off Sam's response, but TTS
-        # streaming already runs in its own tasks so this returns fast.
-        try:
-            await self._agent_callback(text, speaker, state_snapshot)
-        except Exception as e:
-            print(f"[DialogueManager] {self._tag} ⚠️  agent_callback failed: {e}")
-
-        # ── Fire NLU + Policy as TRULY FIRE-AND-FORGET ────────────────
-        # We do NOT await this. process_turn returns now.
-        # The NLU task applies state updates via _nlu_serial_lock when it
-        # completes (typically 500-3000ms later, long after Sam has
-        # started speaking).
-        self._pending_nlu_tasks = [
-            t for t in self._pending_nlu_tasks if not t.done()
-        ]
-        nlu_task = asyncio.create_task(
-            self._run_nlu_policy_background(state_snapshot, turn_data)
-        )
-        self._pending_nlu_tasks.append(nlu_task)
-
-        # Also schedule persist (non-blocking)
-        self._schedule_persist()
-
-        total_ms = int((time.monotonic() - turn_start) * 1000)
-        print(f"[DialogueManager] {self._tag} ✅ Turn {turn_num} dispatched "
-              f"({total_ms}ms, NLU running in background)")
-
-    # ══════════════════════════════════════════════════════════════════════
-    # PARALLEL-FLOW HELPERS (new — latency optimization)
-    # ══════════════════════════════════════════════════════════════════════
-
-    def _fast_path_decision(self, text: str, speaker: str) -> "PolicyDecision":
-        """Compute a fast decision using regex/heuristics (~2ms).
-
-        This is used to unblock the driver in websocket_server.py so Sam
-        can start responding BEFORE NLU finishes. The real NLU-based
-        decision overwrites this a second later; by then the agent is
-        already streaming.
-
-        Rules (first match wins):
-        1. Obvious scope_out keyword → scope_redirect (conf 0.80)
-        2. Question ending in "?" AND mentions cached ticket → respond_direct cached (conf 0.90)
-        3. Question ending in "?" → respond_direct general (conf 0.85)
-        4. Default → respond_direct general (conf 0.85)
-
-        Returns conf >= 0.85 so the driver's gate (conf >= 0.85) fires.
-        """
-        lower = text.lower().strip()
-        state = self._state or {}
-
-        # Rule 1: scope_out regex check
-        scope_out_list = state.get("scope_out", []) or []
-        for topic in scope_out_list:
-            if not topic:
-                continue
-            topic_lower = str(topic).lower().strip()
-            if topic_lower and topic_lower in lower:
-                return PolicyDecision(
-                    action=PolicyAction.SCOPE_REDIRECT,
-                    reasoning=f"Fast-path: scope_out keyword '{topic_lower}'",
-                    scope_topic_raised=topic_lower,
-                    confidence=0.80,
-                )
-
-        # Rule 2/3: question + ticket detection
-        import re
-        ticket_pattern = re.compile(r"\b([A-Z][A-Z0-9_]+-\d+)\b", re.IGNORECASE)
-        ticket_matches = ticket_pattern.findall(text)
-        cached = state.get("pre_loaded_tickets", {}) or {}
-        has_cached_ticket = any(
-            t.upper() in cached for t in ticket_matches
-        )
-
-        if has_cached_ticket:
-            return PolicyDecision(
-                action=PolicyAction.RESPOND_DIRECT,
-                reasoning="Fast-path: cached ticket referenced",
-                confidence=0.90,
-                use_ticket_cache=True,
-            )
-
-        # Rule 4: default respond_direct (general)
-        # Use 0.85 so it meets the driver's gate for fast-path firing
-        return PolicyDecision(
-            action=PolicyAction.RESPOND_DIRECT,
-            reasoning="Fast-path: default respond_direct (NLU pending)",
-            confidence=0.85,
-        )
-
-    async def _fire_agent_safe(
-        self, text: str, speaker: str, state: MeetingState
-    ) -> None:
-        """Fire the agent callback with error handling.
-
-        In observer mode, this logs 'suppressed' and returns immediately.
-        In driver mode, this kicks off Sam's response (may take several
-        seconds for TTS to complete).
-        """
-        try:
-            await self._agent_callback(text, speaker, state)
-        except Exception as e:
-            print(f"[DialogueManager] {self._tag} ⚠️  agent_callback failed: {e}")
-
-    async def _run_nlu_policy_background(
-        self, state_snapshot: MeetingState, turn_data: dict
-    ) -> None:
-        """Run NLU + Policy in background, apply state updates.
-
-        Fire-and-forget task. process_turn does NOT await this — it
-        runs while Sam is already speaking based on the fast-path
-        decision.
-
-        Flow:
-        1. Run NLU analyzer (slow, ~600-3000ms — doesn't block user)
-        2. Run Policy engine (fast, rule-based)
-        3. Acquire _nlu_serial_lock (serialize concurrent NLU tasks)
-        4. Apply NLU + Policy state updates to self._state
-        5. Update _last_committed_decision (for FUTURE observer reads)
-
-        Takes turn_data as a parameter (not from self._pending_turn)
-        because self._pending_turn may be overwritten by the next turn
-        before this task finishes.
-
-        Errors are logged but never raised.
-        """
-        speaker = turn_data["speaker"]
-        user_text = turn_data["text"]
-        turn_number = turn_data["turn_number"]
-        timestamp = turn_data["timestamp"]
-
-        try:
-            # ── Build NLU context from snapshot ───────────────────────
-            agenda = state_snapshot.get("agenda", [])
-            agenda_titles = [a.title for a in agenda]
-            current = get_current_topic(state_snapshot)
-            current_topic_str = current.title if current else ""
-            preloaded = list(state_snapshot.get("pre_loaded_tickets", {}).keys())
-            recent_turns = state_snapshot.get("conversation_turns", [])[-6:]
-            history_lines = [f"{t.speaker}: {t.text}" for t in recent_turns]
-
-            # ── Run NLU (slow, typically 600-3000ms) ──────────────────
-            nlu_start = time.monotonic()
-            nlu = await self._nlu_analyzer.analyze(
-                user_text=user_text,
-                speaker=speaker,
-                participants=state_snapshot.get("participants", []),
-                agenda_titles=agenda_titles,
-                scope_in=state_snapshot.get("scope_in", []),
-                scope_out=state_snapshot.get("scope_out", []),
-                current_topic=current_topic_str,
-                preloaded_tickets=preloaded,
-                sam_last_response=state_snapshot.get("sam_last_response", ""),
-                conversation_history=history_lines,
-            )
-            nlu_ms = int((time.monotonic() - nlu_start) * 1000)
-
-            # ── Run Policy (fast, rule-based) ──────────────────────────
-            # Uses live self._state (could reflect newer turns, which is
-            # fine — policy is mostly stateless wrt conversation flow).
-            decision = self._policy_engine.decide(nlu, self._state)
-
-            # ── Apply state updates under serial lock ──────────────────
-            async with self._nlu_serial_lock:
-                # Only update _pending_nlu if this is still the current turn
-                # (otherwise the next turn's fast-path already set things)
-                if turn_number == self._turn_counter:
-                    self._pending_nlu = nlu
-                    self._pending_decision = decision
-                    self._last_committed_decision = decision
-
-                # ── Apply NLU state updates ──────────────────────────
-                entity_values = [
-                    e.get("value", "") for e in nlu.entities
-                    if e.get("confidence", 0) >= 0.7
-                ]
-                new_turn = Turn(
-                    turn_number=turn_number,
-                    speaker=speaker,
-                    text=user_text,
-                    timestamp=timestamp,
-                    is_sam=False,
-                    intent=nlu.intent,
-                    entities=entity_values,
-                )
-                ticket_keys = nlu.get_ticket_keys()
-
-                # Mutate self._state directly (lock ensures no races with
-                # other NLU tasks; process_turn only reads from snapshots)
-                turns = list(self._state.get("conversation_turns", []))
-                turns.append(new_turn)
-                self._state["conversation_turns"] = turns
-
-                contributions = dict(self._state.get("participant_contributions", {}))
-                contributions[speaker] = contributions.get(speaker, 0) + 1
-                self._state["participant_contributions"] = contributions
-
-                if ticket_keys:
-                    existing_refs = list(self._state.get("tickets_referenced", []))
-                    for k in ticket_keys:
-                        if k not in existing_refs:
-                            existing_refs.append(k)
-                    self._state["tickets_referenced"] = existing_refs
-
-                print(f"[DialogueManager] {self._tag} 🔵 nlu ({nlu_ms}ms async): "
-                      f"turn_{turn_number} [{speaker}] intent={nlu.intent} "
-                      f"tickets={ticket_keys}")
-
-                # ── Apply Policy state updates ────────────────────────
-                # 1. Commitment extraction
-                if nlu.commitment and nlu.commitment.get("confidence", 0) >= 0.7:
-                    c = nlu.commitment
-                    new_commitment = Commitment(
-                        id=f"commit_{turn_number}",
-                        owner=c.get("owner", ""),
-                        action=c.get("action", ""),
-                        deadline=c.get("deadline"),
-                        confidence=c.get("confidence", 0.0),
-                        status="open",
-                        source_utterance=user_text[:200],
-                        related_ticket=self._extract_related_ticket(nlu),
-                    )
-                    existing = list(self._state.get("commitments_open", []))
-                    existing.append(new_commitment)
-                    self._state["commitments_open"] = existing
-                    print(f"[DialogueManager] {self._tag} 📝 Commitment: "
-                          f"{new_commitment.owner} → {new_commitment.action[:40]} "
-                          f"(due: {new_commitment.deadline})")
-
-                # 2. Topic transition
-                if decision.action == PolicyAction.TRANSITION_TOPIC:
-                    agenda_list = self._state.get("agenda", [])
-                    current_idx = self._state.get("current_topic_index", -1)
-                    resolved = list(self._state.get("topics_resolved", []))
-                    if 0 <= current_idx < len(agenda_list):
-                        agenda_item = agenda_list[current_idx]
-                        if agenda_item.id not in resolved:
-                            resolved.append(agenda_item.id)
-                            self._state["topics_resolved"] = resolved
-                    if current_idx + 1 < len(agenda_list):
-                        self._state["current_topic_index"] = current_idx + 1
-                    else:
-                        self._state["current_topic_index"] = -1
-
-                # 3. Scope deviation
-                if decision.action == PolicyAction.SCOPE_REDIRECT:
-                    deviation = ScopeDeviation(
-                        turn_number=turn_number,
-                        topic_raised=decision.scope_topic_raised or "unspecified",
-                        sam_handled_how="redirected",
-                    )
-                    deviations = list(self._state.get("scope_deviations", []))
-                    deviations.append(deviation)
-                    self._state["scope_deviations"] = deviations
-
-                print(f"[DialogueManager] {self._tag} 🔵 policy (async): "
-                      f"→ {decision.action.value} (conf={decision.confidence:.2f}) "
-                      f"| {state_summary_for_logging(self._state)}")
-
-        except Exception as e:
-            print(f"[DialogueManager] {self._tag} ⚠️  NLU/Policy background "
-                  f"task failed (turn {turn_number}): {e}")
-            import traceback
-            traceback.print_exc()
-
-    def _schedule_persist(self) -> None:
-        """Schedule async state persistence (non-blocking)."""
-        if self._checkpoint_mgr:
-            # Clean up completed persist tasks to prevent unbounded growth
-            self._pending_persists = [t for t in self._pending_persists if not t.done()]
-            task = asyncio.create_task(self._persist_async())
-            self._pending_persists.append(task)
+            except Exception as e:
+                print(f"[DialogueManager] {self._tag} ⚠️  Turn {turn_num} failed: {e}")
+                import traceback
+                traceback.print_exc()
+                # Don't crash the whole bot — log and continue with stale state
+            finally:
+                self._pending_turn = None
+                self._pending_nlu = None
+                self._pending_decision = None
 
     def record_sam_response(self, text: str) -> None:
         """Record Sam's response into state.
@@ -3386,25 +3209,10 @@ class DialogueManager:
             print(f"[DialogueManager] {self._tag} ⚠️  Persist failed: {e}")
 
     async def close(self) -> None:
-        """Final cleanup: wait for pending persists + NLU tasks + final save."""
+        """Final cleanup: wait for pending persists + do one final save + mark closed."""
         if self._closed:
             return
         self._closed = True
-
-        # Wait for any in-flight NLU background tasks (so their state
-        # updates land before we persist the final snapshot).
-        if self._pending_nlu_tasks:
-            pending_nlu = [t for t in self._pending_nlu_tasks if not t.done()]
-            if pending_nlu:
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*pending_nlu, return_exceptions=True),
-                        timeout=5.0,
-                    )
-                except asyncio.TimeoutError:
-                    print(f"[DialogueManager] {self._tag} ⚠️  Timeout waiting for "
-                          f"{len(pending_nlu)} NLU task(s)")
-            self._pending_nlu_tasks.clear()
 
         # Wait for any in-flight background persist tasks to finish
         if self._pending_persists:
