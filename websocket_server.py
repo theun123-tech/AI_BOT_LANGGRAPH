@@ -13,7 +13,6 @@ import base64
 import os
 import re as _re
 import random
-from typing import Optional
 from aiohttp import web
 import aiohttp
 from collections import deque
@@ -46,8 +45,22 @@ except Exception as _dm_import_err:
     print(f"[WebSocketServer] ⚠️  DialogueManager unavailable: {_dm_import_err}")
 
 # Deepgram Flux for standup STT (separate from Recall's Deepgram)
-DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "")
-GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "")
+# Stage R: warm the rotator cache. The actual key per call/session is fetched
+# via key_rotator.key_for_session(...) below — DEEPGRAM_API_KEY here just
+# indicates whether Deepgram is configured at all (for boolean gates).
+try:
+    from key_rotator import load_keys as _kr_load_keys
+    _kr_load_keys("DEEPGRAM")
+except Exception:
+    pass
+DEEPGRAM_API_KEY = os.environ.get("DEEPGRAM_API_KEY", "") or (
+    os.environ.get("DEEPGRAM_API_KEYS", "").split(",")[0].strip() if
+    os.environ.get("DEEPGRAM_API_KEYS", "").strip() else ""
+)
+GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", "") or (
+    os.environ.get("GROQ_API_KEYS", "").split(",")[0].strip() if
+    os.environ.get("GROQ_API_KEYS", "").strip() else ""
+)
 
 # ── Per-Speaker Flux toggle (client mode only) ──────────────────────────────
 # When True AND mode != "standup":
@@ -66,14 +79,19 @@ USE_PER_SPEAKER_FLUX = os.environ.get("USE_PER_SPEAKER_FLUX", "1") != "0"
 
 USE_UNIFIED_RESEARCH = os.environ.get("USE_UNIFIED_RESEARCH", "1") != "0"
 USE_DYNAMIC_FILLERS  = os.environ.get("USE_DYNAMIC_FILLERS",  "1") != "0"
-# Fire dynamic filler at EOT confirmation (gives it ~200ms head start so
-# the filler LLM beats the router LLM and we use the warm contextual
-# filler instead of falling back to hardcoded). Set to "0" to revert
-# to the old behavior of firing inside _process().
-EARLY_FILLER_FIRE    = os.environ.get("EARLY_FILLER_FIRE",    "1") != "0"
 USE_SMART_PRELOAD    = os.environ.get("USE_SMART_PRELOAD",    "1") != "0"
 USE_CONVERSATION_MEMORY = os.environ.get("USE_CONVERSATION_MEMORY", "1") != "0"
-
+RESEARCH_PROVIDER = os.environ.get("RESEARCH_PROVIDER", "brave").strip().lower()
+# ──────────────────────────────────────────────────────────────────────────────
+# Stage 2: unified research architecture flag.
+#   "unified" (default) → use the new _unified_research_v2 path: planner-driven,
+#                         conditional parallel Exa+Jira fetch, single synthesis
+#                         with always-injected profile/agenda/memory blocks.
+#   "legacy"            → skip v2, fall through to existing USE_UNIFIED_RESEARCH
+#                         and the original parallel Jira+web+Azure block.
+# v2 returns None on any error → legacy block runs as safety net.
+# ──────────────────────────────────────────────────────────────────────────────
+RESEARCH_ARCHITECTURE = os.environ.get("RESEARCH_ARCHITECTURE", "unified").strip().lower()
 # ── Week 4: DialogueManager toggle ──────────────────────────────────────────
 # When "1": LangGraph-based dialogue manager runs alongside existing pipeline
 #           (observer mode). NLU + Policy decisions are logged but NOT enforced.
@@ -159,6 +177,44 @@ def _is_backchannel(text: str) -> bool:
         return cleaned in _BACKCHANNEL_DOUBLE
     # 3+ words = real utterance, never a backchannel
     return False
+
+
+# ── Phantom STT filter ──────────────────────────────────────────────────────
+# STT (Flux) sometimes hallucinates single words like "two" or "seven" from
+# breathing, background noise, or silence between Sam's TTS output. These
+# phantom transcriptions trigger FAST INTERRUPT and stop Sam mid-sentence
+# even though the user never actually spoke.
+#
+# Known hallucinations seen in production logs:
+#   "two"   — appears between Sam's chunked TTS audio bursts (most common)
+#   "seven" — same pattern as "two", less frequent
+#
+# We filter these as no-ops in interim transcripts. Multi-word transcripts
+# always pass through — if the user actually says "two of the tickets are
+# done", that's real speech and should interrupt normally.
+_PHANTOM_SINGLE_WORDS = frozenset({"two", "seven"})
+
+def _is_phantom_filler(text: str) -> bool:
+    """Return True if text is a known STT hallucination (suppress as no-op).
+
+    STRICT MATCHING — only single words from _PHANTOM_SINGLE_WORDS qualify.
+    Multi-word transcripts NEVER match, even if they contain "two" or
+    "seven" — those are real speech.
+
+    Returns False for:
+      - Empty text
+      - Multi-word transcripts (always real speech)
+      - Single words NOT in the phantom registry
+    """
+    if not text:
+        return False
+    cleaned = text.lower().strip().rstrip('.?!,').strip()
+    if not cleaned:
+        return False
+    # Strict single-word match — multi-word releases never qualify
+    if " " in cleaned:
+        return False
+    return cleaned in _PHANTOM_SINGLE_WORDS
 
 _INTERRUPT_ACKS = [
     "Oh sorry, go ahead.",
@@ -248,9 +304,9 @@ def _convert_spoken_ticket_refs(text: str, project_key: str) -> str:
 
 
 class BotSession:
-    STRAGGLER_WAIT = 0.2   # 200ms straggler for confident RESPOND
+    STRAGGLER_WAIT = 0.2   # Reduced from 0.4 for faster non-direct response
     STRAGGLER_DIRECT = 0.0  # No straggler for "Sam, ..." — direct address is complete
-    WAIT_TIMEOUT   = 0.25  # Reduced from 2.0s — EOT WAIT branch was wasting 1.75s/turn
+    WAIT_TIMEOUT   = 2.0
 
     def __init__(self, session_id, bot_id, server):
         self.session_id = session_id
@@ -264,7 +320,7 @@ class BotSession:
         self.started_at = time.time()
 
         self.agent = PMAgent()
-        self.speaker = CartesiaSpeaker(bot_id=bot_id)
+        self.speaker = CartesiaSpeaker(bot_id=bot_id, session_id=session_id)
         self.trigger = TriggerDetector()
         self.vad = RmsVAD()
 
@@ -293,13 +349,15 @@ class BotSession:
         self.eot_task = None
         self.searching = False
 
-        # Pre-fired dynamic filler task (fires at EOT to give the filler LLM
-        # a 200ms head start so it beats the router and we actually use the
-        # warm dynamic filler instead of falling back to hardcoded).
-        # Lifecycle: set in _run_eot_check(), consumed in _process(), cancelled
-        # on interrupt / new EOT / cleanup.
-        self._pending_filler_task: Optional[asyncio.Task] = None
-        self._pending_filler_text: str = ""    # text the filler was generated for
+        # Pre-fired dynamic filler task (Ship 4 — fire-after-EOT pattern).
+        # Started after EOT decides RESPOND, runs in parallel with the
+        # response pipeline (NLU → Policy → Router → Agent). When the
+        # router returns RESEARCH, this task is almost always ready,
+        # giving us contextual fillers without latency overhead. When
+        # the router returns PM, this task gets cancelled (one wasted
+        # Groq call per PM turn — acceptable trade-off for research
+        # turn quality).
+        self._pending_filler_task: asyncio.Task | None = None
 
         self.audio_event_count = 0
         self.max_conf = 0.0
@@ -307,6 +365,19 @@ class BotSession:
 
         self._jira_context = ""
         self._ticket_cache = []  # Structured list of pre-loaded tickets
+
+        # Stage 2.5: research context cache (kept as fallback under
+        # RESEARCH_JOURNAL_ENABLED=0). Replaced in normal operation by
+        # the journal+rewriter design below.
+        self._research_cache = self._make_empty_cache()
+
+        # Stage 2.6: research journal pointer (the actual journal lives on
+        # self.agent.journal — we just keep a reference here for clarity).
+        # Also the rewriter task: _handle_addressee_decision fires it in
+        # parallel with EOT/addressee, _unified_research_v2 awaits the result.
+        self._research_journal = None  # set after agent is wired
+        self._last_rewriter_task: asyncio.Task | None = None
+        self._last_rewritten_query: str | None = None
 
         # ── Option C: Deferred Ticket Creation ──
         # Instead of creating tickets mid-meeting (which often produces garbage
@@ -453,8 +524,14 @@ class BotSession:
                 and USE_PER_SPEAKER_FLUX
                 and DEEPGRAM_API_KEY
                 and GROQ_API_KEY):
+            # Stage R: lock one Deepgram key to this session for its lifetime
+            try:
+                from key_rotator import key_for_session as _key_for_session
+                _dg_key = _key_for_session("DEEPGRAM", self.session_id) or DEEPGRAM_API_KEY
+            except Exception:
+                _dg_key = DEEPGRAM_API_KEY
             self._flux_manager = FluxSessionManager(
-                api_key=DEEPGRAM_API_KEY,
+                api_key=_dg_key,
                 on_final=self._on_flux_final_client,
                 on_interim=self._on_flux_interim_client,
                 keyterms=None,  # No keyterms — avoid echo→keyterm hallucination
@@ -550,6 +627,35 @@ class BotSession:
                         )
                 except Exception as e:
                     print(f"[{ts()}] {self.tag} ⚠️  Ticket cache build failed: {e}")
+                # ── Client profile from "Know About Them" UI feature ─────────
+                # The /api/clients/research endpoint returns profile_text; the UI
+                # is responsible for sending it back in the /start setup body.
+                # Try multiple key names defensively. If none match, profile stays
+                # empty and Sam will speak honestly without grounding (the
+                # synthesis prompts already handle empty client_profile_block).
+                cp_raw = (
+                    setup.get("client_profile")
+                    or setup.get("client_profile_text")
+                    or setup.get("profile_text")
+                    or setup.get("clientProfile")
+                    or setup.get("about_them")
+                    or ""
+                )
+                client_profile_text = cp_raw.strip() if isinstance(cp_raw, str) else ""
+
+                # Diagnostic — tells us in the logs whether the UI sent the
+                # profile. Critical for fixing "online payment solution" and
+                # "Rohan the CEO" hallucinations end-to-end.
+                print(f"[{ts()}] {self.tag} 📋 _meeting_setup keys: {sorted(setup.keys())}")
+                if client_profile_text:
+                    print(f"[{ts()}] {self.tag} 📋 client_profile: "
+                          f"{len(client_profile_text)} chars (preview: "
+                          f"{client_profile_text[:120]!r}...)")
+                else:
+                    print(f"[{ts()}] {self.tag} 📋 client_profile: EMPTY — "
+                          f"UI did not send it under any known key. Sam will "
+                          f"answer company-fact questions without grounding.")
+
                 await self._dialogue_manager.initialize(
                     participants=sorted(self._attendees) if self._attendees else [],
                     agenda=agenda_items,
@@ -559,13 +665,15 @@ class BotSession:
                     prior_meeting_summaries=[],
                     commitments_inherited=[],
                     planned_duration_minutes=int(setup.get("planned_duration_minutes") or 30),
+                    client_profile=client_profile_text,
                 )
                 if setup or preloaded:
                     print(f"[{ts()}] {self.tag} 📋 Setup injected: "
                           f"agenda={len(agenda_items)}, "
                           f"scope_in={len(setup.get('scope_in') or [])}, "
                           f"scope_out={len(setup.get('scope_out') or [])}, "
-                          f"tickets={len(preloaded)}")
+                          f"tickets={len(preloaded)}, "
+                          f"client_profile={len(client_profile_text)} chars")
 
                 # Phase 4B step 1: read + cache DM mode once, log it
                 try:
@@ -601,51 +709,6 @@ class BotSession:
         elif USE_DIALOGUE_MANAGER and not _DIALOGUE_MANAGER_AVAILABLE:
             print(f"[{ts()}] {self.tag} ⚠️  USE_DIALOGUE_MANAGER=1 but modules "
                   f"not importable — see startup warning above")
-
-        # ── Warm all Groq connections + start keepalive pingers ──────────
-        # Without this, each of the 12 keys pays 200-500ms cold-start tax
-        # on its first use. Warmup runs in parallel, ~1-2s total.
-        try:
-            warm_tasks = []
-            # Agent client
-            agent_client = getattr(self.agent, 'client', None)
-            if agent_client and hasattr(agent_client, 'warm_all_keys'):
-                warm_tasks.append(agent_client.warm_all_keys())
-            # Trigger client
-            trigger_client = getattr(self.trigger, '_client', None) or \
-                             getattr(self.trigger, 'client', None)
-            if trigger_client and hasattr(trigger_client, 'warm_all_keys'):
-                warm_tasks.append(trigger_client.warm_all_keys())
-            # Addressee decider client
-            ad = getattr(self, '_addressee_decider', None)
-            if ad:
-                ad_client = getattr(ad, '_client', None) or \
-                            getattr(ad, 'client', None)
-                if ad_client and hasattr(ad_client, 'warm_all_keys'):
-                    warm_tasks.append(ad_client.warm_all_keys())
-            # NLU analyzer client
-            dm = getattr(self, '_dialogue_manager', None)
-            if dm:
-                nlu = getattr(dm, '_nlu_analyzer', None)
-                if nlu:
-                    nlu_client = getattr(nlu, 'client', None) or \
-                                 getattr(nlu, '_client', None) or \
-                                 getattr(nlu, '_groq_client', None)
-                    if nlu_client and hasattr(nlu_client, 'warm_all_keys'):
-                        warm_tasks.append(nlu_client.warm_all_keys())
-
-            if warm_tasks:
-                await asyncio.gather(*warm_tasks, return_exceptions=True)
-                print(f"[{ts()}] {self.tag} 🔥 Groq connections warmed "
-                      f"({len(warm_tasks)} client(s))")
-
-                # Start keepalive pingers — keeps connections from going idle
-                if agent_client and hasattr(agent_client, 'start_keepalive_task'):
-                    agent_client.start_keepalive_task()
-                if trigger_client and hasattr(trigger_client, 'start_keepalive_task'):
-                    trigger_client.start_keepalive_task()
-        except Exception as e:
-            print(f"[{ts()}] {self.tag} ⚠️  Groq warmup failed (non-fatal): {e}")
 
         print(f"[{ts()}] {self.tag} ✅ Session ready (bot: {self.bot_id[:12]})")
 
@@ -774,8 +837,6 @@ class BotSession:
             self.current_task.cancel()
         if self.eot_task and not self.eot_task.done():
             self.eot_task.cancel()
-        # Pre-fired filler — cancel if a turn was in flight when session ended
-        self._cancel_pending_filler(reason="cleanup")
 
         # ── Per-speaker Flux cleanup (client mode) ─────────────────────────
         if self._addressee_decider:
@@ -938,7 +999,13 @@ class BotSession:
                 print(f"[{ts()}] {self.tag} ⚠️  Conversation summary failed (non-fatal): {e}")
 
         try:
-            session_store.save_session(session_data)
+            # Standups have their own tab via standup_flow.save_standup() — don't
+            # double-save them into sessions.json (which feeds the Sessions tab).
+            # Client calls and other modes still save here as normal.
+            if self.mode == "standup":
+                print(f"[{ts()}] {self.tag} ℹ️  Standup mode — skipping Sessions-tab save (standup already saved to Standups tab)")
+            else:
+                session_store.save_session(session_data)
         except Exception as e:
             print(f"[{ts()}] {self.tag} ⚠️  Save session failed: {e}")
 
@@ -1140,6 +1207,231 @@ class BotSession:
             parts.append(f"Open: {', '.join(open_items)}.")
 
         return " ".join(parts)
+
+    # ── PHASE 1: Door #1 ticket enrichment helpers ────────────────────────────
+    # When a research-route question mentions a specific ticket key (e.g.
+    # "SCRUM-87"), we fetch the LIVE ticket from Jira and inject it into the
+    # persona prompt sent to Brave AI Mode. This lets Brave answer with current
+    # ticket state instead of guessing or hallucinating.
+
+    def _detect_ticket_keys(self, text: str) -> list[str]:
+        """Extract ticket keys (e.g. SCRUM-87) from user text.
+
+        Returns up to 5 unique keys, in the order they appear. Uses the project
+        prefix from self.jira.project (typically 'SCRUM') so this adapts if the
+        Jira project changes. Falls back to common prefix patterns if Jira
+        isn't configured.
+
+        Examples:
+          "What's the status of SCRUM-87?"        → ["SCRUM-87"]
+          "Compare SCRUM-12, SCRUM-15, SCRUM-22"  → ["SCRUM-12", "SCRUM-15", "SCRUM-22"]
+          "Tell me about my login bug"            → []   (no key mentioned)
+          "Status of scrum 87"                    → ["SCRUM-87"] (case-insensitive, space-tolerant)
+        """
+        if not text:
+            return []
+
+        # Build pattern from the active project key (e.g. SCRUM, PROJ, ABC).
+        # Fall back to a permissive 2-10 letter pattern if Jira not configured.
+        if self.jira and self.jira.enabled and self.jira.project:
+            project_prefix = _re.escape(self.jira.project)
+        else:
+            project_prefix = r"[A-Z][A-Z0-9_]{1,9}"
+
+        # Pattern matches:
+        #   SCRUM-87, scrum-87, SCRUM 87, scrum_87
+        # Case-insensitive, allowing space/underscore between prefix and number.
+        # Word boundaries prevent matching mid-word (e.g. "ABC-12345-X" → only ABC-12345).
+        pattern = rf"\b({project_prefix})[\s_-]+(\d{{1,6}})\b"
+
+        keys = []
+        seen = set()
+        for match in _re.finditer(pattern, text, _re.IGNORECASE):
+            prefix = match.group(1).upper()
+            number = match.group(2)
+            key = f"{prefix}-{number}"
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
+                if len(keys) >= 5:  # Cap to avoid abuse / huge Jira fetches
+                    break
+        return keys
+
+    def _format_fresh_tickets_for_prompt(self, tickets: list[dict]) -> str:
+        """Format freshly-fetched Jira tickets for injection into Door #1's
+        persona prompt.
+
+        Output is prepended to project_context so Brave AI Mode reads these
+        FIRST (highest priority info). Format is compact prose-friendly bullets
+        that match the existing project_context style.
+
+        Each ticket includes: key, status, summary, truncated description.
+        Max ~150 chars per ticket to keep total prompt reasonable.
+        """
+        if not tickets:
+            return ""
+
+        lines = ["FRESHLY FETCHED FROM JIRA (live, just now):"]
+        for t in tickets[:5]:  # Defensive cap
+            if not isinstance(t, dict):
+                continue
+            key = t.get("key", "?")
+            status = (t.get("status") or "?").strip()
+            summary = (t.get("summary") or "(no summary)").strip()
+            desc = (t.get("description") or "").strip()
+            # Compact format: "- KEY (status): summary — description"
+            line = f"- {key} ({status}): {summary}"
+            if desc:
+                # Truncate description aggressively — we just need a hint
+                desc_clean = _re.sub(r"\s+", " ", desc).strip()
+                if len(desc_clean) > 120:
+                    desc_clean = desc_clean[:117] + "..."
+                line += f" — {desc_clean}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    # ── Ship 3: agenda + client_profile blocks for Door #1 prompt ─────────────
+    # These pull from session state (DialogueManager) and format them for
+    # injection into the Brave persona prompt. They prevent the "agenda
+    # hallucination" bug where Brave invented an agenda from ticket data.
+
+    def _build_agenda_block_for_prompt(self) -> str:
+        """Build the AGENDA section for Brave's structured prompt.
+
+        Reads agenda from DialogueManager state. Formats as numbered bullets
+        with status markers for each topic. Marks the current topic with an
+        arrow so Brave knows what's being discussed right now.
+
+        Returns "(no fixed agenda for today)" if no agenda is loaded — Brave's
+        prompt instructions tell it to say so honestly rather than fabricate.
+        """
+        if self._dialogue_manager is None:
+            return "(no fixed agenda for today)"
+        try:
+            snap = self._dialogue_manager.get_state_snapshot()
+        except Exception:
+            return "(no fixed agenda for today)"
+
+        if "error" in snap:
+            return "(no fixed agenda for today)"
+
+        agenda = snap.get("agenda") or []
+        if not agenda:
+            return "(no fixed agenda for today)"
+
+        topic_idx = snap.get("current_topic_index", -1)
+        lines = []
+        for i, item in enumerate(agenda):
+            if isinstance(item, dict):
+                title = (item.get("title") or "").strip()
+                status = (item.get("status") or "pending").strip()
+            else:
+                title = str(item).strip()
+                status = "pending"
+            if not title:
+                continue
+            # Mark current topic with arrow; show status for done/skipped
+            marker = "→" if i == topic_idx else " "
+            status_tag = ""
+            if status == "done":
+                status_tag = " [DONE]"
+            elif status == "skipped":
+                status_tag = " [SKIPPED]"
+            elif i == topic_idx:
+                status_tag = " [CURRENT]"
+            lines.append(f"{marker} {i+1}. {title}{status_tag}")
+        return "\n".join(lines) if lines else "(no fixed agenda for today)"
+
+    def _build_client_profile_block_for_prompt(self) -> str:
+        """Build the CLIENT PROFILE section for Brave's structured prompt.
+
+        Combines two pieces:
+          1. PEOPLE ON THIS CALL — explicit participant names so Brave addresses
+             the right person (prevents Sam from making up names like "Rachel"
+             or "Mike"). Reads from self._attendees (session-level) which is
+             populated as people join the call. This is the authoritative
+             source — DialogueManager's participants list is not always kept
+             in sync.
+          2. COMPANY BACKGROUND — research about the client's business, if a
+             profile was loaded via the "Know About Them" feature.
+
+        Returns "(no client profile loaded)" if neither attendees nor profile
+        text exist (e.g. very early in the call before anyone has joined).
+        """
+        # Read attendees directly from session state (single source of truth).
+        # DialogueManager's participants field is not reliably synced — using
+        # self._attendees avoids the "Sam invents names" bug.
+        names = sorted(
+            n for n in (self._attendees or set())
+            if n and n.strip() and n.strip().lower() != "sam"
+        )
+
+        # Client profile (from "Know About Them" UI, if loaded). This goes
+        # through DialogueManager state because that's where the UI writes it.
+        cp = ""
+        if self._dialogue_manager is not None:
+            try:
+                snap = self._dialogue_manager.get_state_snapshot()
+                if "error" not in snap:
+                    cp = (snap.get("client_profile") or "").strip()
+            except Exception:
+                pass
+
+        if not cp and not names:
+            return "(no client profile loaded)"
+
+        chunks = []
+
+        # Sam's company (the bot is Sam @ AnavClouds, fixed identity)
+        chunks.append("OUR COMPANY: AnavClouds Software Solutions "
+                      "(Salesforce consulting, based in Jaipur, India)")
+
+        # People on the call — explicit and authoritative
+        if names:
+            if len(names) == 1:
+                chunks.append(
+                    f"ON THIS CALL: {names[0]} is the only client on this call. "
+                    f"Address them as \"{names[0]}\". "
+                    f"Do NOT use any other name — there is no one else here."
+                )
+            else:
+                names_str = ", ".join(names)
+                chunks.append(
+                    f"ON THIS CALL: {names_str} ({len(names)} people total). "
+                    f"Use only these names when addressing clients. "
+                    f"Do NOT invent or use any other names."
+                )
+
+        # Stage 2.12: explicit speaker-to-profile binding.
+        # Old heading "CLIENT BACKGROUND" was vague reference framing.
+        # New heading tells Sam: the people on this call work at this
+        # company; answer their personal-context questions from THIS profile,
+        # not from web search.
+        if cp:
+            # Stage 2.7: cap raised from 600 to 2500. Production logs showed
+            # the 1659-char profile was being chopped in half on every research
+            # synthesis (profile=842 chars). Azure 4o-mini has 16k context
+            # window — 2500 chars of profile is well within budget.
+            if len(cp) > 2500:
+                cp = cp[:2497].rsplit(" ", 1)[0] + "..."
+            chunks.append(
+                "CLIENT YOU\'RE MEETING WITH "
+                "(the person(s) on this call WORK AT the company described "
+                "below. This is authoritative info about who they are and "
+                "what their company does. When they ask \"my company\", "
+                "\"our team\", \"the CEO\", \"our work\", \"my industry\" — "
+                "the answer is in THIS profile. Do NOT search the web for "
+                "personal questions about the speaker\'s company; ground "
+                "your response in this profile. Use this context to make "
+                "every recommendation specific to their actual business, "
+                "products, and challenges. IMPORTANT: names mentioned IN "
+                "this background — founders, executives, advisors — are "
+                "usually NOT on the call; only address the speaker by the "
+                "names listed under ON THIS CALL above):\n"
+                f"{cp}"
+            )
+
+        return "\n".join(chunks)
 
     # ── Client Mode Contextual Reprompt ──────────────────────────────────────
 
@@ -1416,8 +1708,6 @@ class BotSession:
                 self.interrupt_event.set()
                 if self.current_task and not self.current_task.done():
                     self.current_task.cancel()
-                    # Cancel any pre-fired filler — interrupt invalidates it
-                    self._cancel_pending_filler(reason="user interrupt")
                 self.speaking = False
                 self.audio_playing = False
                 self.buffer.clear()
@@ -1480,6 +1770,13 @@ class BotSession:
                     # so single-word transcripts are real intent (not noise).
                     word_count = len(text.split())
                     if word_count >= 1:
+                        # Phantom STT filter: "two", "seven", etc. — known
+                        # hallucinations from silence/breathing between Sam's
+                        # TTS chunks. Suppress these as no-ops.
+                        if _is_phantom_filler(text):
+                            print(f"[{ts()}] {self.tag} 🚫 Phantom filler "
+                                  f"ignored: \"{text}\"")
+                            return
                         self._partial_interrupted = True
                         self._partial_interrupt_time = time.time()
                         print(f"[{ts()}] {self.tag} ⚡ FAST INTERRUPT via interim: \"{text[:40]}\" ({word_count} words) — stopping audio")
@@ -1490,8 +1787,6 @@ class BotSession:
                         self.interrupt_event.set()
                         if self.current_task and not self.current_task.done():
                             self.current_task.cancel()
-                            # Cancel any pre-fired filler — interrupt invalidates it
-                            self._cancel_pending_filler(reason="user interrupt")
                         # Cancel standup flush so _processing gets released
                         if self.standup_flow and not self.standup_flow.is_done:
                             if self._standup_timer and not self._standup_timer.done():
@@ -1536,8 +1831,6 @@ class BotSession:
                 self.interrupt_event.set()
                 if self.current_task and not self.current_task.done():
                     self.current_task.cancel()
-                    # Cancel any pre-fired filler — interrupt invalidates it
-                    self._cancel_pending_filler(reason="user interrupt")
                 # Release standup processing lock on interrupt
                 if self.standup_flow and not self.standup_flow.is_done:
                     if self._standup_timer and not self._standup_timer.done():
@@ -1652,6 +1945,43 @@ class BotSession:
         return t.startswith("sam,") or t.startswith("sam ") or t == "sam" or \
                t.startswith("hey sam") or t.startswith("hi sam") or t.startswith("hello sam")
 
+    def _maybe_fire_pending_filler(self, text: str) -> None:
+        """Ship 4: Pre-fire dynamic filler after EOT decides RESPOND.
+
+        Starts the Groq filler generation in the background so it cooks in
+        parallel with NLU + Policy + Router (~1.5-2s of pipeline). By the
+        time the router decides RESEARCH, the filler is almost always ready.
+
+        Skip rules:
+          - Dynamic fillers disabled (USE_DYNAMIC_FILLERS=0)
+          - Utterance too short (<6 words) — likely small talk, not a
+            research question, no need to burn Groq quota
+          - Existing pending filler not yet consumed — cancel old, start fresh
+
+        The task is stored in self._pending_filler_task and consumed (or
+        cancelled) by the response pipeline downstream.
+        """
+        if not USE_DYNAMIC_FILLERS:
+            return
+
+        # Skip filler for short utterances (small talk, acknowledgments).
+        # These rarely route to RESEARCH and don't need contextual fillers.
+        word_count = len(text.split())
+        if word_count < 6:
+            return
+
+        # Cancel any stale pending task from a previous turn that didn't
+        # get consumed (defensive — shouldn't normally happen).
+        if self._pending_filler_task is not None and not self._pending_filler_task.done():
+            self._pending_filler_task.cancel()
+
+        # Fire the new filler — runs in background, harvested at router time.
+        self._pending_filler_task = asyncio.create_task(
+            self.agent.generate_dynamic_filler(text)
+        )
+        print(f"[{ts()}] {self.tag} 🎨 Pre-fired dynamic filler "
+              f"(running in parallel with pipeline)")
+
     # ══════════════════════════════════════════════════════════════════════
     # Per-speaker Flux integration (client mode only)
     # ══════════════════════════════════════════════════════════════════════
@@ -1720,6 +2050,14 @@ class BotSession:
             # Any transcribed word interrupts (Flux filters non-speech too)
             word_count = len(text.split())
             if word_count >= 1:
+                # Phantom STT filter: "two", "seven", etc. — known
+                # hallucinations from silence/breathing between Sam's TTS
+                # chunks. Suppress these as no-ops to prevent false
+                # mid-response interrupts.
+                if _is_phantom_filler(text):
+                    print(f"[{ts()}] {self.tag} 🚫 Phantom filler "
+                          f"ignored from {speaker}: \"{text}\"")
+                    return
                 self._partial_interrupted = True
                 self._partial_interrupt_time = time.time()
                 print(f"[{ts()}] {self.tag} ⚡ FAST INTERRUPT via interim "
@@ -1732,8 +2070,6 @@ class BotSession:
                 self.interrupt_event.set()
                 if self.current_task and not self.current_task.done():
                     self.current_task.cancel()
-                    # Cancel any pre-fired filler — interrupt invalidates it
-                    self._cancel_pending_filler(reason="user interrupt")
                 self.speaking = False
                 self.audio_playing = False
                 self.vad.end_turn()
@@ -1809,6 +2145,22 @@ class BotSession:
         if self._dialogue_manager is not None:
             asyncio.create_task(self._run_dialogue_manager_observer(
                 decision.text, speaker))
+
+        # ── Stage 2.6: query rewriter (parallel with EOT/addressee) ───────
+        # Fire-and-forget. _unified_research_v2 awaits the result later.
+        # Latest decision wins — cancel any in-flight prior rewrite.
+        try:
+            if self._last_rewriter_task and not self._last_rewriter_task.done():
+                self._last_rewriter_task.cancel()
+            convo_lines = list(self.convo_history)[-5:] if self.convo_history else []
+            convo_str = "\n".join(convo_lines) if convo_lines else "(start of conversation)"
+            self._last_rewriter_task = asyncio.create_task(
+                self.agent.rewrite_query(decision.text, convo_str)
+            )
+            self._last_rewritten_query = None  # cleared until task resolves
+        except Exception as e:
+            print(f"[{ts()}] {self.tag} ⚠️  Rewriter task spawn failed: {e}")
+            self._last_rewriter_task = None
 
         self._schedule_eot_check(speaker)
 
@@ -1892,14 +2244,20 @@ class BotSession:
                 "voice call that is wrapping up. Speak a warm, brief wrap-up in 4-6 "
                 "sentences (~30 seconds spoken). Rules:\n"
                 "1. Start directly — no \"let me summarize\" preamble\n"
-                "2. Mention each commitment naturally, by name: "
-                "\"Sahil, you are reviewing SCRUM-244 by Monday\" "
-                "(not \"Sahil committed to review\")\n"
+                "2. Mention each commitment naturally, by name. Format example: "
+                "\"<NAME>, you are <ACTION> by <DEADLINE>\" "
+                "(not \"<NAME> committed to <ACTION>\"). "
+                "<NAME> is a placeholder — replace with the actual owner from MEETING DATA below. "
+                "Do NOT keep the angle brackets in your output.\n"
                 "3. Mention what was deferred if anything\n"
                 "4. Flag open questions for next time if any\n"
                 "5. End with a warm sign-off (\"great session, catch you later\")\n"
                 "6. Say ticket keys naturally: \"SCRUM-244\" not \"SCRUM dash 244\"\n"
-                "7. Pick 2-3 most important items — do not list everything\n\n"
+                "7. Pick 2-3 most important items — do not list everything\n"
+                "8. CRITICAL: only use names that appear in the Participants list or "
+                "Commitments captured below. NEVER invent a name. If a commitment has "
+                "no clear owner, say \"the team\" or \"we\" instead. Names that are not "
+                "in MEETING DATA must not appear in your output.\n\n"
                 f"MEETING DATA:\n{data_block}"
             )
 
@@ -1944,6 +2302,103 @@ class BotSession:
             raise
         except Exception as e:
             print(f"[{ts()}] {self.tag} ⚠️  recap failed (non-fatal): {e}")
+
+    # Stage 2.10 Checkpoint 1: skip journal on live-fetch policy
+    def _policy_demanded_live_fetch(self) -> tuple[bool, str]:
+        """Return (True, reason) if the most recent Policy decision was
+        respond_with_research with a freshness hint, indicating fresh data
+        is required. Used by both smart brain and quick brain to skip the
+        journal lookup and go straight to research.
+
+        Read order:
+          1. self._dialogue_manager.get_last_decision() — the structured decision
+          2. Match against known live-fetch reasoning strings from dialogue.py:
+             - "live fetch needed"
+             - "freshness hint"
+             - "not cached"
+
+        Kill switch: POLICY_OVERRIDE_JOURNAL=0 → always returns (False, "")
+        so the journal lookup proceeds regardless of policy.
+        """
+        import os as _os
+        if _os.environ.get("POLICY_OVERRIDE_JOURNAL", "1").strip() == "0":
+            return (False, "kill switch")
+
+        try:
+            if self._dialogue_manager is None:
+                return (False, "no DM")
+            decision = self._dialogue_manager.get_last_decision()
+            if decision is None:
+                return (False, "no decision")
+
+            action = getattr(decision, "action", None)
+            action_str = action.value if hasattr(action, "value") else str(action)
+            reasoning = (getattr(decision, "reasoning", "") or "").lower()
+
+            # Live-fetch signals from dialogue.py Policy reasoning strings
+            live_fetch_signals = [
+                "live fetch needed",
+                "freshness hint",
+                "not cached",
+                "fresh fetch",
+                "needs fresh",
+            ]
+
+            if action_str == "respond_with_research":
+                for signal in live_fetch_signals:
+                    if signal in reasoning:
+                        return (True, f"Policy: {signal}")
+                # respond_with_research without explicit live-fetch hint
+                # is still a research path — caller can choose to skip
+                # journal or not. We return False here to let the journal
+                # try, since the reasoning string didn't demand fresh data.
+            return (False, f"action={action_str}")
+        except Exception as e:
+            print(f"[{ts()}] {self.tag} ⚠️  Policy check error: "
+                  f"{type(e).__name__}: {e}")
+            return (False, "error")
+
+    # Stage 2.10 Checkpoint 3: stall-phrase detection
+    @staticmethod
+    def _is_stall_response(text: str) -> tuple[bool, str]:
+        """Detect when an LLM response is a stalling placeholder rather than
+        a real answer. Returns (True, matched_phrase) or (False, "").
+
+        Stall phrases are things humans say when they don't know but want to
+        be polite — "let me check", "give me a sec", "I'll get back to you".
+        For Sam, these are non-answers that need to fall through to real
+        research.
+
+        Kill switch: STALL_DETECTION_ENABLED=0 → always returns (False, "")
+        """
+        import os as _os
+        import re as _re
+        if _os.environ.get("STALL_DETECTION_ENABLED", "1").strip() == "0":
+            return (False, "")
+        if not text or not text.strip():
+            return (False, "")
+
+        # Check the first ~200 chars — stalls are always at the beginning
+        head = text.strip()[:200].lower()
+
+        # Phrases that indicate Sam is promising future action instead of answering
+        stall_patterns = [
+            r"let me (?:check|look|pull|grab|fetch|see|review|verify)",
+            r"i(?:'ll| will) (?:check|look|pull|grab|fetch|get back|verify|review)",
+            r"give me (?:a|one|just a) (?:moment|sec|second|minute)",
+            r"hold on (?:while|a sec|a moment)",
+            r"bear with me",
+            r"one (?:moment|sec|second) (?:while|please)",
+            r"i need to (?:check|look|verify|pull|fetch)",
+            r"let me (?:just )?(?:take a |have a )?(?:quick )?(?:look|peek)",
+        ]
+
+        for pattern in stall_patterns:
+            m = _re.search(pattern, head)
+            if m:
+                return (True, m.group(0))
+
+        return (False, "")
 
     async def _fast_pm_response(self, user_text: str) -> None:
         """Router skip: general fast-path for high-confidence respond_direct.
@@ -1997,19 +2452,140 @@ class BotSession:
 
             context_block = "\n".join(state_parts) if state_parts else ""
 
+            # Participant guard — fixes "Tom"/"Mike"/etc. hallucinations.
+            # _build_client_profile_block_for_prompt() lists the actual people
+            # on the call. Without this block, the LLM invents generic names
+            # when the prompt says "use their name."
+            client_profile_block = self._build_client_profile_block_for_prompt()
+
+            # ─── Stage 2.8 + 2.10: quick brain journal lookup ─────────────
+            # Stage 2.10 Checkpoint 1: skip journal entirely if Policy demanded
+            # live fetch — quick brain can't fetch, but at least we won't ship
+            # a stalling answer from a stale entry.
+            import os as _os_qb
+            prior_research_block = ""
+            qb_live_fetch, qb_reason = self._policy_demanded_live_fetch()
+            if qb_live_fetch:
+                print(f"[{ts()}] {self.tag} 📔 Quick-brain skipping journal — "
+                      f"{qb_reason}")
+            elif _os_qb.environ.get("QUICK_BRAIN_JOURNAL_ENABLED", "1").strip() != "0":
+                try:
+                    journal = getattr(self.agent, "journal", None)
+                    if journal is not None and journal.size > 0:
+                        # Prefer the rewritten query (entity-resolved) if the
+                        # rewriter task already finished. Otherwise use raw text.
+                        search_query = user_text
+                        try:
+                            if (self._last_rewriter_task is not None and
+                                    self._last_rewriter_task.done() and
+                                    not self._last_rewriter_task.cancelled()):
+                                rq = self._last_rewriter_task.result()
+                                if rq and isinstance(rq, str) and rq.strip():
+                                    search_query = rq.strip()
+                        except Exception:
+                            pass
+
+                        # Stage 2.10 Checkpoint 2: stricter journal hits
+                        try:
+                            qb_strict_thresh = float(
+                                _os_qb.environ.get("JOURNAL_MIN_SCORE", "0.7")
+                            )
+                        except ValueError:
+                            qb_strict_thresh = 0.7
+                        qb_peek_thresh = 0.5
+
+                        matches = await journal.search(
+                            search_query, top_k=1, min_score=qb_peek_thresh
+                        )
+                        if matches:
+                            score, entry = matches[0]
+                            n_tickets = len(entry.get("jira_tickets") or [])
+                            n_web = len(entry.get("web_results") or [])
+                            has_data = (n_tickets > 0 or n_web > 0)
+
+                            # Accept hit only if score-strict OR has-data
+                            if score < qb_strict_thresh and not has_data:
+                                print(f"[{ts()}] {self.tag} 📔 Quick-brain journal "
+                                      f"weak hit (score={score:.3f}, no data) — "
+                                      f"treating as miss")
+                                matches = []  # downgrade to miss
+
+                        if matches:
+                            score, entry = matches[0]
+                            n_tickets = len(entry.get("jira_tickets") or [])
+                            n_web = len(entry.get("web_results") or [])
+                            print(f"[{ts()}] {self.tag} 📔 Quick-brain journal HIT: "
+                                  f"score={score:.3f}, data=(t={n_tickets},w={n_web}), "
+                                  f"q='{entry.get('question', '')[:60]}'")
+
+                            # Build PRIOR RESEARCH block
+                            cached_synth = (entry.get("synthesis_output") or "").strip()
+                            tickets = entry.get("jira_tickets") or []
+                            web_results = entry.get("web_results") or []
+
+                            block_lines = []
+                            if cached_synth:
+                                block_lines.append(
+                                    f"What you said earlier in this call: \"{cached_synth[:600]}\""
+                                )
+                            if tickets:
+                                tlines = []
+                                for t in tickets[:4]:
+                                    key = t.get("key", "?")
+                                    summary = (t.get("summary") or "").strip()[:80]
+                                    status = t.get("status") or "?"
+                                    tlines.append(f"  - {key} [{status}]: {summary}")
+                                if tlines:
+                                    block_lines.append(
+                                        "Tickets discussed:\n" + "\n".join(tlines)
+                                    )
+                            if web_results:
+                                wlines = []
+                                for r in web_results[:2]:
+                                    title = (r.get("title") or "").strip()[:80]
+                                    content = (r.get("content") or "").strip()[:200]
+                                    if content:
+                                        wlines.append(f"  - {title}: {content}")
+                                if wlines:
+                                    block_lines.append(
+                                        "Web research from earlier:\n" + "\n".join(wlines)
+                                    )
+
+                            if block_lines:
+                                prior_research_block = (
+                                    "\n\nPRIOR RESEARCH ON THIS TOPIC "
+                                    "(use this to answer the user's follow-up "
+                                    "naturally — they're asking about something "
+                                    "you already covered):\n"
+                                    + "\n\n".join(block_lines)
+                                )
+                        else:
+                            print(f"[{ts()}] {self.tag} 📔 Quick-brain journal MISS")
+                except Exception as e:
+                    print(f"[{ts()}] {self.tag} ⚠️  Quick-brain journal lookup failed "
+                          f"(non-fatal): {type(e).__name__}: {e}")
+
             system = (
                 "You are Sam, a senior PM at AnavClouds Software Solutions, on a "
                 "live voice call. Respond to what the user said in 1-2 sentences. "
                 "Rules:\n"
-                "- Natural and warm. Use contractions. Use their name occasionally.\n"
+                "- Natural and warm. Use contractions.\n"
+                "- Address the user by name ONLY if their name appears in the "
+                "WHO IS ON THIS CALL section below. Do NOT invent names. Do NOT "
+                "use placeholder names like Tom, Mike, Sarah, John, Rachel. If "
+                "no name is listed, just speak naturally without addressing "
+                "anyone by name.\n"
                 "- Do NOT use: \"seriously\", \"honestly\", \"actually\", \"as I said\", "
                 "\"obviously\" — these sound condescending.\n"
                 "- No \"let me check\" filler — you are answering directly.\n"
                 "- If you do not know, say so briefly. Do not invent specifics.\n"
                 "- Under 25 words total. You are on voice, keep it tight.\n"
+                "\nWHO IS ON THIS CALL:\n" + client_profile_block
             )
             if context_block:
-                system = system + "\nMEETING CONTEXT:\n" + context_block
+                system = system + "\n\nMEETING CONTEXT:\n" + context_block
+            if prior_research_block:
+                system = system + prior_research_block
 
             try:
                 resp_text = await asyncio.wait_for(
@@ -2027,6 +2603,23 @@ class BotSession:
                 return
 
             resp_text = resp_text.strip()
+
+            # Stage 2.10 Checkpoint 3: stall-phrase detection
+            # If the LLM responded with "let me check on Jira" or similar
+            # placeholder text, it's promising action instead of answering.
+            # Quick brain can't fetch, so this would leave the user hanging.
+            # Skip the response and let the trigger pipeline handle it via
+            # the research path.
+            is_stall, stall_phrase = self._is_stall_response(resp_text)
+            if is_stall:
+                print(f"[{ts()}] {self.tag} 🛑 Quick-brain stall detected: "
+                      f"'{stall_phrase}' — skipping response, "
+                      f"trigger pipeline will handle research")
+                # Don't speak, don't log as Sam's response. The Trigger pipeline
+                # is still active (not cancelled in this path), so it will
+                # produce a real answer via _unified_research_v2.
+                return
+
             print(f"[{ts()}] {self.tag} 🎮 [DRIVER] fast-pm response "
                   f"({len(resp_text)} chars): {resp_text[:80]}...")
             self._log_sam(resp_text)
@@ -2040,7 +2633,7 @@ class BotSession:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            print(f"[{ts()}] {self.tag} ⚠️  fast-pm failed (non-fatal): {e}")
+            print(f"[{ts()}] {self.tag} ⚠️  fast-pm failed (non-fatal): {e}")   
 
     async def _fast_cached_response(self, user_text: str, ticket_keys: list,
                                      cached_tickets: dict) -> None:
@@ -2081,12 +2674,21 @@ class BotSession:
                       f"after lookup — aborting")
                 return
 
+            # Participant guard — same fix as _fast_pm_response. Lists the
+            # actual people on the call so Sam can't invent names.
+            client_profile_block = self._build_client_profile_block_for_prompt()
+
             fast_system = (
                 "You are Sam, a senior PM at AnavClouds Software Solutions, on a live "
                 "voice call. Answer the user concisely in 1-3 sentences using ONLY the "
                 "ticket data below. Speak conversationally, no \"let me check\" filler — "
                 "you already have the data. Mention ticket keys naturally (e.g. "
                 "\"SCRUM-244\"), not like \"SCRUM dash 244\".\n\n"
+                "Address the user by name ONLY if their name appears in WHO IS ON THIS "
+                "CALL below. Do NOT invent names. Do NOT use placeholder names like "
+                "Tom, Mike, Sarah, John, Rachel. If no name is listed, just speak "
+                "naturally without addressing anyone by name.\n\n"
+                "WHO IS ON THIS CALL:\n" + client_profile_block + "\n\n"
                 "CACHED TICKET DATA:\n" + "\n".join(ticket_lines)
             )
 
@@ -2313,23 +2915,43 @@ class BotSession:
         #   (a) Cached ticket referenced → _fast_cached_response (ticket data)
         #   (b) No cached ticket → _fast_pm_response (general meeting context)
         # Skips Router LLM (800-3800ms) + research path entirely.
+        #
+        # Ship 3 fix: ALWAYS probe for ticket keys regardless of the
+        # `use_ticket_cache` flag. The flag was sometimes False even when
+        # Policy explicitly logged "Ticket(s) all cached — use cache",
+        # causing ticket questions to fall through to _fast_pm_response
+        # which doesn't know about specific tickets and would hallucinate
+        # wrong ticket data (e.g. answering about SCRUM-244 when asked
+        # about SCRUM-200).
         if action_str == "respond_direct":
             if confidence < 0.85:
                 return  # low conf — let Trigger handle (fallback)
 
-            # Probe for cached ticket context
+            # Always probe for ticket keys in user text — ignore the
+            # potentially-stale use_ticket_cache flag from policy.
             ticket_hits = []
             cached_tickets = {}
-            if getattr(decision, "use_ticket_cache", False):
-                import re as _re
-                ticket_keys = _re.findall(r"\b([A-Z]+-\d+)\b", text.upper())
+            try:
+                import re as _re_local
+                ticket_keys = _re_local.findall(r"\b([A-Z]+-\d+)\b", text.upper())
                 if ticket_keys:
-                    try:
-                        dm_state = self._dialogue_manager.get_state_snapshot()
-                        cached_tickets = dm_state.get("pre_loaded_tickets") or {}
-                        ticket_hits = [k for k in ticket_keys if k in cached_tickets]
-                    except Exception:
-                        pass
+                    dm_state = self._dialogue_manager.get_state_snapshot()
+                    cached_tickets = dm_state.get("pre_loaded_tickets") or {}
+                    ticket_hits = [k for k in ticket_keys if k in cached_tickets]
+                    if ticket_hits:
+                        print(f"[{ts()}] {self.tag} 🎯 Fast-path ticket probe: "
+                              f"detected {ticket_keys}, cache hits: {ticket_hits}")
+                    elif ticket_keys:
+                        print(f"[{ts()}] {self.tag} 🎯 Fast-path ticket probe: "
+                              f"detected {ticket_keys} but none in cache "
+                              f"— routing to research path instead")
+                        # User asked about specific tickets that aren't cached.
+                        # Don't invent answers via _fast_pm_response. Let the
+                        # research path handle it (Door #1 enrichment will
+                        # fetch them fresh from Jira).
+                        return  # falls through to Trigger → research path
+            except Exception as _e:
+                print(f"[{ts()}] {self.tag} ⚠️  Fast-path ticket probe failed: {_e}")
 
             # Cancel Trigger regardless of variant
             task = self.current_task
@@ -2367,76 +2989,9 @@ class BotSession:
 
     # ══════════════════════════════════════════════════════════════════════
 
-    # ── Pre-fired dynamic filler lifecycle ────────────────────────────
-    # The filler task is fired at EOT (before _process) so it has time
-    # to complete before the router decides RESEARCH. These helpers
-    # keep the task lifecycle clean across new EOTs and interrupts.
-
-    def _cancel_pending_filler(self, reason: str = "") -> None:
-        """Cancel the pre-fired filler task if any. Safe to call repeatedly."""
-        if self._pending_filler_task is not None:
-            if not self._pending_filler_task.done():
-                self._pending_filler_task.cancel()
-            self._pending_filler_task = None
-            self._pending_filler_text = ""
-            if reason:
-                # Only log when reason is provided so we don't spam on no-op calls
-                pass  # no-op print to keep logs clean; uncomment to debug
-
-    def _fire_early_filler(self, text: str) -> None:
-        """Fire a dynamic filler task NOW with the given text.
-
-        Cancels any prior pending filler first (race protection: if a new
-        EOT fires before the old turn's filler is consumed, kill the old).
-        """
-        if not EARLY_FILLER_FIRE or not USE_DYNAMIC_FILLERS:
-            return
-        if not text or not text.strip():
-            return
-        # Cancel previous (e.g., user paused, new EOT fired)
-        self._cancel_pending_filler(reason="new EOT")
-        try:
-            self._pending_filler_task = asyncio.create_task(
-                self.agent.generate_dynamic_filler(text)
-            )
-            self._pending_filler_text = text
-        except Exception as e:
-            print(f"[{ts()}] {self.tag} ⚠️  Early filler fire failed: {e}")
-            self._pending_filler_task = None
-            self._pending_filler_text = ""
-
-    def _consume_pending_filler(self, text: str) -> Optional[asyncio.Task]:
-        """Take ownership of pre-fired filler if it matches the current text.
-
-        Returns the task (caller is responsible for awaiting/cancelling) or
-        None if no usable filler exists. Clears self._pending_filler_task
-        on success so cleanup paths don't double-cancel.
-
-        We compare exact text — if it differs, the buffer changed between
-        EOT and processing (e.g., late straggler words arrived) and the
-        old filler was generated for stale text. Cancel and let _process
-        fall back to its inline filler creation.
-        """
-        if self._pending_filler_task is None:
-            return None
-        if self._pending_filler_text != text:
-            # Text changed — old filler is stale, drop it
-            self._cancel_pending_filler(reason="text changed")
-            return None
-        task = self._pending_filler_task
-        self._pending_filler_task = None
-        self._pending_filler_text = ""
-        return task
-
-    # ══════════════════════════════════════════════════════════════════════
-
     def _schedule_eot_check(self, speaker):
         if self.eot_task and not self.eot_task.done():
             self.eot_task.cancel()
-        # RACE PROTECTION: if a previous EOT fired a filler that hasn't been
-        # consumed yet, cancel it. The new EOT is for newer speech and will
-        # fire its own filler with up-to-date text.
-        self._cancel_pending_filler(reason="new EOT scheduled")
         self.eot_task = asyncio.create_task(self._run_eot_check(speaker))
 
     async def _run_eot_check(self, speaker):
@@ -2450,42 +3005,29 @@ class BotSession:
             # ── Fast path: direct address skips EOT classifier + straggler ──
             if self._is_direct_address(full_text):
                 print(f"[{ts()}] {self.tag} ⚡ Direct address — skipping EOT + straggler")
-                # Fire filler now — it'll run in parallel with downstream
-                # trigger + router (~150-300ms head start).
-                self._fire_early_filler(full_text)
                 # No straggler wait at all
-            elif full_text.rstrip().endswith("?"):
-                # Fast path: question ending in "?" is always RESPOND
-                # Saves 300-500ms of EOT LLM call on every question
-                print(f"[{ts()}] {self.tag} ⚡ Question — skipping EOT, short straggler")
-                # Fire filler before the 200ms straggler wait — turns dead
-                # time into useful prefill for the filler LLM.
-                self._fire_early_filler(full_text)
-                await asyncio.sleep(self.STRAGGLER_WAIT)  # 200ms
+                # Direct-addressed questions still benefit from pre-fired filler
+                # (most are research questions). Skip for short utterances.
+                self._maybe_fire_pending_filler(full_text)
             else:
                 # Normal path: run EOT classifier
                 decision = await self.agent.check_end_of_turn(full_text, context)
                 if decision == "RESPOND":
-                    # ── EARLY FILLER FIRE ────────────────────────────────
-                    # Fire dynamic filler NOW, in parallel with the 200ms
-                    # straggler wait. By the time _process runs the router
-                    # (~T+350-400ms from here), the filler is done and ready.
-                    # Without this head start, the filler would be ~50-200ms
-                    # behind the router and get cancelled.
-                    self._fire_early_filler(full_text)
+                    # Ship 4: Pre-fire dynamic filler IMMEDIATELY when EOT
+                    # decides RESPOND. This gives Groq ~1.5-2s head start
+                    # while NLU + Policy + Router run downstream. By the time
+                    # we get to the router decision, the filler is usually
+                    # already ready, so we get contextual fillers without
+                    # waiting for them.
+                    self._maybe_fire_pending_filler(full_text)
                     await asyncio.sleep(self.STRAGGLER_WAIT)  # 200ms
                 else:
-                    # WAIT — user still talking; no filler (it'd be wasted)
                     await asyncio.sleep(self.WAIT_TIMEOUT)
 
             if self.speaking or not self.buffer:
-                # Either already speaking, or buffer cleared during wait
-                # → cancel any filler we fired (it's wasted)
-                self._cancel_pending_filler(reason="speaking or empty buffer")
                 return
             result = self._get_buffer_text()
             if not result:
-                self._cancel_pending_filler(reason="no buffer text")
                 return
             spk, full_text, t0 = result
             self.buffer.clear()
@@ -2494,9 +3036,6 @@ class BotSession:
             self.last_flushed_text = full_text
             self._start_process(full_text, spk, t0)
         except asyncio.CancelledError:
-            # EOT was cancelled (new speech, new EOT, interrupt, etc.)
-            # _schedule_eot_check / interrupt handlers already cancelled
-            # the filler. Just exit cleanly.
             return
 
     def _get_buffer_text(self):
@@ -2668,17 +3207,11 @@ class BotSession:
         return all_sentences, False  # completed normally
 
     def _build_greeting(self, name: str) -> str:
-        """Warm, conversational greeting that announces the FULL agenda.
+        """Phase 3.5: greeting that announces agenda if setup was provided.
 
-        Falls back to the simple welcome if no agenda is configured.
-
-        Note: prior version (Patch B1) trimmed greetings of 3+ topics
-        to mention only the first topic for latency reasons. That made
-        Sam feel robotic at the start. Reverted to mention every topic
-        warmly — it's a one-time cost at meeting start, not a per-turn
-        latency hit.
+        Falls back to the original greeting if no agenda is configured.
         """
-        base = f"Hey {name}! Good to see you — welcome to the call."
+        base = f"Hey {name}, welcome to the call!"
         setup = self._meeting_setup or {}
         raw_agenda = setup.get("agenda") or []
         titles: list[str] = []
@@ -2696,37 +3229,21 @@ class BotSession:
         n = len(titles)
         if n == 1:
             return (
-                f"Hey {name}! Good to see you. We've got one item on the agenda "
-                f"today — {titles[0]}. Whenever you're ready, we can dive in."
+                f"Hey {name}, welcome. Today we've got one thing on the agenda: "
+                f"{titles[0]}. Ready to dive in?"
             )
         if n == 2:
             return (
-                f"Hey {name}! Welcome. We've got two things to cover today — "
-                f"first, {titles[0]}, and then {titles[1]}. "
-                f"Want to start with the first one?"
+                f"Hey {name}, welcome. Two things on today's agenda — "
+                f"{titles[0]}, and {titles[1]}. "
+                f"Want to start with the first?"
             )
-        if n == 3:
-            return (
-                f"Hey {name}! Good to see you. We've got three topics on the "
-                f"agenda today — {titles[0]}, then {titles[1]}, "
-                f"and finally {titles[2]}. "
-                f"Want to kick things off with the first one?"
-            )
-        # 4+ topics: list them all naturally with "and finally" before the last
-        if n == 4:
-            list_part = (
-                f"{titles[0]}, then {titles[1]}, "
-                f"after that {titles[2]}, and finally {titles[3]}"
-            )
-        else:
-            # 5+: comma-separate the middle ones, keep "and finally" for the last
-            middle = ", then ".join(titles[1:-1])
-            list_part = (
-                f"{titles[0]}, then {middle}, and finally {titles[-1]}"
-            )
+        # 3+ topics: Patch B1 — mention only the first topic to cut
+        # greeting length from ~17s to ~6s. Remaining topics come up
+        # naturally as the meeting flows.
         return (
-            f"Hey {name}! Good to see you. We've got {n} topics today — "
-            f"{list_part}. Sound good? Let's start with the first one whenever you're ready."
+            f"Hey {name}. {n} topics today, first up is {titles[0]}. "
+            f"Ready when you are?"
         )
 
     async def _greet(self, name, t0):
@@ -2850,8 +3367,6 @@ class BotSession:
                     self.interrupt_event.set()
                     if self.current_task and not self.current_task.done():
                         self.current_task.cancel()
-                        # Cancel any pre-fired filler — interrupt invalidates it
-                        self._cancel_pending_filler(reason="user interrupt")
                     self.speaking = False
                     self.audio_playing = False
 
@@ -2895,10 +3410,16 @@ class BotSession:
 
         async def _run_flux():
             try:
+                # Stage R: lock one Deepgram key to this session for its lifetime
+                try:
+                    from key_rotator import key_for_session as _key_for_session
+                    _dg_key = _key_for_session("DEEPGRAM", self.session_id) or DEEPGRAM_API_KEY
+                except Exception:
+                    _dg_key = DEEPGRAM_API_KEY
                 await stream_deepgram(
                     audio_queue=self._stt_queue,
                     transcript_callback=_flux_transcript_callback,
-                    api_key=DEEPGRAM_API_KEY,
+                    api_key=_dg_key,
                     model="flux-general-en",
                     sample_rate=16000,
                     keywords=keywords,
@@ -3085,8 +3606,17 @@ class BotSession:
                 import httpx
                 RECALL_REGION = os.environ.get("RECALLAI_REGION", "ap-northeast-1")
                 RECALL_API_BASE = f"https://{RECALL_REGION}.recall.ai/api/v1"
+                # Stage R: use the same Recall key that was locked to this
+                # session when the bot was created (sticky per-session).
+                try:
+                    from key_rotator import key_for_session as _key_for_session
+                    _recall_key = _key_for_session("RECALLAI", self.session_id)
+                except Exception:
+                    _recall_key = None
+                if not _recall_key:
+                    _recall_key = os.environ['RECALLAI_API_KEY']
                 headers = {
-                    "Authorization": f"Token {os.environ['RECALLAI_API_KEY']}",
+                    "Authorization": f"Token {_recall_key}",
                     "Content-Type": "application/json",
                 }
                 async with httpx.AsyncClient(timeout=10) as client:
@@ -3225,93 +3755,73 @@ class BotSession:
 
     # ── Unified Research Flow (Feature 4) ─────────────────────────────────────
 
+    
     async def _unified_research_flow(self, user_text: str, context: str, my_gen: int,
-                                       filler_duration: float, filler_relay_start: float):
-        """SerpAPI-direct research path with unified LLM planning.
-
+                                    filler_duration: float, filler_relay_start: float):
+        """SerpAPI-direct OR Exa+Azure research path with unified LLM planning.
+    
         Flow:
-          1. Generate unified research plan (Groq 70b, ~600-900ms)
-          2. Based on plan:
-             - jira_status type → bail out, use legacy path (needs synthesis)
-             - Otherwise → gather tickets (cached + fresh if needed)
-          3. Build project context (feature descriptions)
-          4. Call SerpAPI-direct with persona + context + TTS hint
-          5. Clean output + split sentences
-          6. Stream to TTS via same pipelined path as legacy
-
+        1. Generate unified research plan (Groq 70b, ~600-900ms)
+        2. Routing gate: internal_org → fall back to legacy
+        3. Gather tickets (cached + fresh if needed)
+        4. Build project context, agenda, client profile, ticket enrichment
+        5. Branch on RESEARCH_PROVIDER:
+            - "exa"   → Exa search + Azure streaming (NEW) → fall back to Brave on fail
+            - "brave" → SerpAPI Brave AI Mode (existing path)
+        6. Stream sentences to TTS via _stream_pipelined
+    
         Returns:
-          (all_sentences, interrupted) tuple if successful,
-          None if any step failed (caller falls back to legacy synthesis).
-
+        (all_sentences, interrupted) tuple if successful,
+        None if any step failed (caller falls back to legacy synthesis).
+    
         Safety: any failure at any step returns None → legacy fallback kicks in.
         """
         import time as _t
-
-        # Step 1: Unified research planner (ONE Groq 70b call)
+    
+        # Step 1: Unified research planner (ONE Groq 70b call) — UNCHANGED
         plan = await self.agent.generate_unified_research_plan(
             user_text=user_text,
             context=context,
             ticket_cache=self._ticket_cache,
             memory_header=self._memory_header,
         )
-
+    
         if not plan:
-            # Planner failed — fall back to legacy
             return None
-
-        # Step 2: Check if this is a Jira-status query (needs synthesis, not SerpAPI-direct)
+    
+        # Step 2: ROUTING DECISION — UNCHANGED
         qtype = plan.get("question_type", "general")
-        if qtype == "jira_status":
-            # Pure Jira query — legacy path handles these better (Jira action + synthesis)
-            print(f"[{ts()}] {self.tag} 🎯 Unified plan: jira_status → deferring to legacy")
-            return None
-
-        # HALLUCINATION GUARD: internal_org questions (who is our CEO, how many
-        # employees, etc.) must NEVER go through SerpAPI-direct. Google AI Mode
-        # has no reliable internal company data and will confidently make things
-        # up. Defer to legacy Azure synthesis, which can honestly say "I don't
-        # have that specific information" instead.
         if qtype == "internal_org":
-            print(f"[{ts()}] {self.tag} 🛡️  Unified plan: internal_org → deferring to legacy (hallucination guard)")
+            print(f"[{ts()}] {self.tag} 🛡️  Unified plan: internal_org → "
+                f"deferring to legacy (hallucination guard)")
             return None
-
-        # Decision: Only use SerpAPI-direct when the question has project relevance.
-        # General knowledge questions ("Who built the Taj Mahal?") don't benefit from
-        # our project context wrapper and often return no AI Overview. Let Azure
-        # synthesis handle them via the legacy path.
+    
         cached_refs = plan.get("relevant_cached_tickets", [])
         needs_fresh = plan.get("needs_fresh_jira", False)
         features = plan.get("serpapi_context_features", [])
-
-        has_project_relevance = bool(cached_refs) or needs_fresh or (
-            qtype in ("feasibility", "tech_switch", "best_practices")
-        )
-
-        if qtype == "general" and not has_project_relevance:
-            print(f"[{ts()}] {self.tag} 🎯 Unified plan: general knowledge (no project relevance) → deferring to legacy")
-            return None
-
+        print(f"[{ts()}] {self.tag} 🚪 Research path handling {qtype} "
+            f"(provider={RESEARCH_PROVIDER}, cached_refs={len(cached_refs)}, "
+            f"needs_fresh={needs_fresh}, features={len(features)})")
+    
         if self.interrupt_event.is_set() or my_gen != self.generation:
             return None
-
-        # Step 3: Gather tickets (cached + fresh if needed)
+    
+        # Step 3: Gather tickets — UNCHANGED
         relevant_tickets = []
         cached_keys = set(plan.get("relevant_cached_tickets", []))
         if cached_keys:
             for t in self._ticket_cache:
                 if t.get("key") in cached_keys:
                     relevant_tickets.append(t)
-
-        # Fresh Jira fetch if planner says cache is missing relevant work
+    
         if plan.get("needs_fresh_jira") and plan.get("jira_search_terms"):
             if self.jira and self.jira.enabled:
                 try:
                     fresh = await asyncio.wait_for(
                         self.jira.search_text(plan["jira_search_terms"], max_results=5),
-                        timeout=2.5,  # budget cap — filler covers this
+                        timeout=2.5,
                     )
                     if fresh:
-                        # Add to ticket_cache and relevant_tickets, avoiding duplicates
                         existing_keys = {t.get("key") for t in self._ticket_cache}
                         for ft in fresh:
                             if ft.get("key") and ft["key"] not in existing_keys:
@@ -3325,48 +3835,105 @@ class BotSession:
                     print(f"[{ts()}] {self.tag} ⏱ Fresh Jira fetch timeout (>2.5s) — continuing without")
                 except Exception as e:
                     print(f"[{ts()}] {self.tag} ⚠️  Fresh Jira fetch failed: {e}")
-
+    
         if self.interrupt_event.is_set() or my_gen != self.generation:
             return None
-
-        # Step 4: Build project context for SerpAPI
+    
+        # Step 4: Build project context — UNCHANGED
         feature_descriptions = plan.get("serpapi_context_features", [])
         project_context = self.agent._build_project_context_from_tickets(
             tickets=relevant_tickets if relevant_tickets else self._ticket_cache[:10],
             feature_descriptions=feature_descriptions,
         )
-
-        # Length hint based on question type
-        length_hint = {
-            "feasibility": "2-3 sentences",
-            "tech_switch": "3-4 sentences",
-            "best_practices": "2-3 sentences",
-            "general": "2-3 sentences",
-        }.get(qtype, "2-3 sentences")
-
-        # Step 5: SerpAPI-direct call
+    
+        # Step 4b: PHASE 1 — Read-only ticket enrichment (sequential Jira fetch) — UNCHANGED
+        enriched_ticket_block = ""
+        try:
+            ticket_keys_in_question = self._detect_ticket_keys(user_text)
+            if ticket_keys_in_question and self.jira and self.jira.enabled:
+                print(f"[{ts()}] {self.tag} 🎯 Enrichment: detected "
+                    f"{len(ticket_keys_in_question)} ticket key(s) in question: "
+                    f"{ticket_keys_in_question}")
+                t_jira = time.time()
+                fresh_tickets = await self.jira.get_tickets_batch(ticket_keys_in_question)
+                jira_ms = (time.time() - t_jira) * 1000
+                if fresh_tickets:
+                    enriched_ticket_block = self._format_fresh_tickets_for_prompt(
+                        fresh_tickets
+                    )
+                    print(f"[{ts()}] {self.tag} ✅ Enrichment: fetched "
+                        f"{len(fresh_tickets)}/{len(ticket_keys_in_question)} ticket(s) "
+                        f"from Jira ({jira_ms:.0f}ms)")
+                else:
+                    print(f"[{ts()}] {self.tag} ⚠️  Enrichment: Jira returned "
+                        f"0 tickets for {ticket_keys_in_question} ({jira_ms:.0f}ms) "
+                        f"— prompt will rely on cached context")
+        except Exception as _enrich_e:
+            print(f"[{ts()}] {self.tag} ⚠️  Enrichment failed "
+                f"({type(_enrich_e).__name__}: {_enrich_e}) — falling back to cached context")
+    
+        if enriched_ticket_block:
+            if project_context:
+                project_context = enriched_ticket_block + "\n" + project_context
+            else:
+                project_context = enriched_ticket_block
+    
+        # Step 4c: Build agenda + client_profile blocks — UNCHANGED
+        agenda_block = self._build_agenda_block_for_prompt()
+        client_profile_block = self._build_client_profile_block_for_prompt()
+    
+        if self.interrupt_event.is_set() or my_gen != self.generation:
+            return None
+    
+        length_hint = "70-90 words across 4-5 sentences"
+    
+        # ═════════════════════════════════════════════════════════════════════════
+        # STEP 5: BRANCH ON RESEARCH_PROVIDER — this is the NEW logic
+        # ═════════════════════════════════════════════════════════════════════════
+    
+        # Path: EXA + Azure streaming
+        if RESEARCH_PROVIDER == "exa":
+            exa_succeeded = await self._try_exa_research_path(
+                user_text=user_text,
+                project_context=project_context,
+                agenda_block=agenda_block,
+                client_profile_block=client_profile_block,
+                context=context,
+                plan=plan,
+                length_hint=length_hint,
+                my_gen=my_gen,
+                filler_duration=filler_duration,
+                filler_relay_start=filler_relay_start,
+            )
+            if exa_succeeded is not None:
+                # Either succeeded (returns tuple) OR failed cleanly (returns None
+                # to trigger Brave fallback below). When it returns a tuple we use it.
+                return exa_succeeded
+            # exa_succeeded is None → fall through to Brave path below
+            print(f"[{ts()}] {self.tag} 🔄 Exa path returned None — falling back to Brave")
+    
+        # Path: BRAVE AI Mode (default + Exa fallback) — EXISTING logic, unchanged
         response_text = await self.agent.serpapi_direct_research(
             user_text=user_text,
             project_context=project_context,
             conversation=context,
             length=length_hint,
+            agenda_block=agenda_block,
+            client_profile_block=client_profile_block,
         )
-
+    
         if not response_text:
-            # SerpAPI-direct failed/empty — fall back to legacy
             return None
-
+    
         if self.interrupt_event.is_set() or my_gen != self.generation:
             return None
-
-        # Step 6: Split into sentences and stream to TTS pipeline
+    
         sentences = self.agent._split_sentences(response_text)
         if not sentences:
             return None
-
-        # Use same pipelined streaming as legacy path for consistent behavior
+    
         research_queue: asyncio.Queue = asyncio.Queue()
-
+    
         async def _fill_queue():
             try:
                 for s in sentences:
@@ -3375,9 +3942,9 @@ class BotSession:
                     await research_queue.put(s)
             finally:
                 await research_queue.put(None)
-
+    
         filler_stream_task = asyncio.create_task(_fill_queue())
-
+    
         if self._streaming_mode:
             all_sentences, interrupted = await self._stream_pipelined(
                 research_queue, my_gen, cancel_task=filler_stream_task,
@@ -3385,7 +3952,6 @@ class BotSession:
                 relay_start_override=filler_relay_start)
             return (all_sentences, interrupted)
         else:
-            # Non-streaming fallback: speak each sentence
             spoken: list = []
             while True:
                 try:
@@ -3400,6 +3966,1358 @@ class BotSession:
                     return (spoken, True)
                 await self._speak(sent, "research", my_gen)
             return (spoken, False)
+    
+    
+    # ── ALSO ADD THIS HELPER METHOD ────────────────────────────────────────────
+    # Paste this directly below _unified_research_flow (same indent — class method).
+    
+    async def _try_exa_research_path(
+        self,
+        user_text: str,
+        project_context: str,
+        agenda_block: str,
+        client_profile_block: str,
+        context: str,
+        plan: dict,
+        length_hint: str,
+        my_gen: int,
+        filler_duration: float,
+        filler_relay_start: float,
+    ):
+        """Run the Exa + Azure streaming research path.
+    
+        Returns:
+        (all_sentences, interrupted) tuple on success
+        None on failure (caller should fall back to Brave)
+    
+        Failure modes that return None:
+        - Exa returned no usable results
+        - Exa client not configured (missing EXA_API_KEY)
+        - Exa failed 3+ times in this session (circuit breaker)
+        - Azure synthesis failed
+        """
+        import time as _t
+    
+        exa_search = self.agent._get_exa_search()
+    
+        # Bail out if Exa not configured — fall back to Brave
+        if not exa_search.enabled:
+            print(f"[{ts()}] {self.tag} ⚠️  EXA_API_KEY not set — falling back to Brave")
+            return None
+    
+        # Circuit breaker — if Exa keeps failing, stop trying for this session
+        if exa_search.consecutive_failures >= 3:
+            print(f"[{ts()}] {self.tag} ⚠️  Exa circuit-broken "
+                f"({exa_search.consecutive_failures} failures) — using Brave for rest of session")
+            return None
+    
+        # Build the Exa search query — prefer the planner's clean query,
+        # fall back to user_text. Exa expects a search query, NOT a long persona prompt.
+        exa_query = (plan.get("web_search_query") or "").strip()
+        if not exa_query or exa_query.upper() == "SKIP":
+            # Planner didn't produce a search query (e.g. for some Jira-status questions)
+            # Fall back to the user's question, trimmed to a reasonable search query length
+            exa_query = user_text.strip()
+            if len(exa_query) > 200:
+                exa_query = exa_query[:200]
+    
+        print(f"[{ts()}] {self.tag} 🔍 Exa query: \"{exa_query[:80]}\"")
+    
+        # Step 5.1: Exa search
+        t_exa = _t.time()
+        exa_results = await exa_search.search(exa_query, num_results=8)
+        exa_ms = (_t.time() - t_exa) * 1000
+        print(f"[{ts()}] {self.tag} ⏱ Exa search: {exa_ms:.0f}ms")
+    
+        if not exa_results:
+            print(f"[{ts()}] {self.tag} ⚠️  Exa returned no results — falling back to Brave")
+            return None
+    
+        if self.interrupt_event.is_set() or my_gen != self.generation:
+            return None
+    
+        # Step 5.2: Azure streaming synthesis with Exa results
+        research_queue: asyncio.Queue = asyncio.Queue()
+    
+        synthesis_task = asyncio.create_task(
+            self.agent.exa_stream_synthesis_to_queue(
+                user_text=user_text,
+                exa_results=exa_results,
+                project_context=project_context,
+                azure_extractor=self.azure_extractor,
+                queue=research_queue,
+                conversation=context,
+                agenda_block=agenda_block,
+                client_profile_block=client_profile_block,
+                length=length_hint,
+            )
+        )
+    
+        # Step 5.3: Stream sentences to TTS via _stream_pipelined
+        if self._streaming_mode:
+            all_sentences, interrupted = await self._stream_pipelined(
+                research_queue, my_gen, cancel_task=synthesis_task,
+                extra_duration=filler_duration,
+                relay_start_override=filler_relay_start)
+    
+            # Sanity check: if synthesis produced nothing usable, treat as failure
+            if not all_sentences and not interrupted:
+                print(f"[{ts()}] {self.tag} ⚠️  Exa+Azure produced no sentences — "
+                    f"falling back to Brave")
+                return None
+    
+            return (all_sentences, interrupted)
+        else:
+            # Non-streaming fallback (used when audio page disconnected)
+            spoken: list = []
+            while True:
+                try:
+                    item = await asyncio.wait_for(research_queue.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    break
+                if item is None:
+                    break
+                spoken.append(item)
+    
+            if not spoken:
+                print(f"[{ts()}] {self.tag} ⚠️  Exa+Azure produced no sentences "
+                    f"(non-streaming) — falling back to Brave")
+                return None
+    
+            for sent in spoken:
+                if self.interrupt_event.is_set() or my_gen != self.generation:
+                    return (spoken, True)
+                await self._speak(sent, "research", my_gen)
+            return (spoken, False)
+
+    # ── Stage 2: unified research v2 ─────────────────────────────────────────
+
+    async def _unified_research_v2(self, user_text: str, context: str, my_gen: int,
+                                    filler_duration: float, filler_relay_start: float):
+        """Stage 2: single research path with planner-driven conditional fetch.
+
+        Replaces both _unified_research_flow AND the legacy fallback block.
+        Behind RESEARCH_ARCHITECTURE=unified (default).
+
+        Flow:
+          1. Plan (Groq 70b, ~600-900ms)
+          2. Build always-needed blocks (profile, agenda, memory)
+          3. Conditional parallel fetch:
+               - _handle_jira_read (handles transitions/creates/reads, ~1s)
+                 fired when needs_fresh_jira=True OR question_type=="internal_org"
+               - _search_with_fallback (Exa→Brave) fired when web_search_query
+                 is set OR question_type=="internal_org"
+          4. Build project_context from cached + freshly-fetched tickets
+          5. Single synthesis via unified_synthesis_to_queue
+          6. Stream sentences via existing _stream_pipelined
+
+        For internal_org: legacy behavior — fetch both, let synthesis sort it
+        out. Profile/agenda always injected so hallucinations stay impossible.
+
+        Returns:
+          (all_sentences, interrupted) tuple if successful
+          None if any step failed (caller's safety-net legacy block runs)
+        """
+        import time as _t
+        import json as _json
+        import asyncio  # Stage 2.6 hotfix: needed for asyncio.wait_for/shield below
+
+        # ─── Stage 2.6: journal retrieval with rewritten query ─────────────
+        # Replaces Stage 2.5's heuristic single-slot cache. Now:
+        #   1. Wait for the rewriter task that was fired in _handle_addressee
+        #      (already running in parallel — usually done by now).
+        #   2. Search the research journal by embedding similarity.
+        #   3. If a match is found above min_score, fast PM with that entry.
+        #   4. ESCALATE → fresh research path below.
+        #
+        # Kill switch: RESEARCH_JOURNAL_ENABLED=0 → falls back to Stage 2.5
+        #              single-slot cache (which has known pollution issues but
+        #              is preserved as a fallback).
+        import os as _os
+        use_journal = _os.environ.get("RESEARCH_JOURNAL_ENABLED", "1").strip() != "0"
+
+        rewritten_query = user_text  # default if rewriter unavailable / disabled
+        if use_journal:
+            # Step 1: await the rewriter (fired in _handle_addressee_decision)
+            if self._last_rewriter_task is not None:
+                try:
+                    rewritten_query = await asyncio.wait_for(
+                        asyncio.shield(self._last_rewriter_task),
+                        timeout=1.5,
+                    )
+                    self._last_rewritten_query = rewritten_query
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    print(f"[{ts()}] {self.tag} ⚠️  Rewriter not ready — using raw")
+                    rewritten_query = user_text
+                except Exception as e:
+                    print(f"[{ts()}] {self.tag} ⚠️  Rewriter await failed: {e}")
+                    rewritten_query = user_text
+
+            # Stage 2.10 Checkpoint 1: skip journal on live-fetch policy
+            # If Policy demanded fresh data, don't let journal intercept.
+            live_fetch, reason = self._policy_demanded_live_fetch()
+            if live_fetch:
+                print(f"[{ts()}] {self.tag} 📔 Skipping journal lookup — "
+                      f"{reason} (going straight to research)")
+            else:
+                # Step 2: search journal
+                try:
+                    journal = getattr(self.agent, "journal", None)
+                    if journal and journal.size > 0:
+                        # Stage 2.10 Checkpoint 2: stricter journal hits.
+                        # Raise threshold from 0.5 to 0.7. Below 0.7 we still
+                        # peek (down to 0.5) but only accept if the entry has
+                        # actual concrete data (tickets or web results).
+                        import os as _os_thresh
+                        try:
+                            strict_thresh = float(
+                                _os_thresh.environ.get("JOURNAL_MIN_SCORE", "0.7")
+                            )
+                        except ValueError:
+                            strict_thresh = 0.7
+                        peek_thresh = 0.5  # below 0.7 but above this requires data
+
+                        matches = await journal.search(
+                            rewritten_query, top_k=1, min_score=peek_thresh
+                        )
+                        if matches:
+                            score, entry = matches[0]
+                            n_tickets = len(entry.get("jira_tickets") or [])
+                            n_web = len(entry.get("web_results") or [])
+                            has_data = (n_tickets > 0 or n_web > 0)
+
+                            # Stage 2.10 Checkpoint 2: accept hit only if
+                            # (score is strict-high) OR (has concrete data)
+                            if score >= strict_thresh or has_data:
+                                # Stage 2.11: journal type-match required.
+                                # Run planner now to get current question_type.
+                                # Compare against entry's stored type. Reject
+                                # cross-topic hits (e.g. capital-of-India entry
+                                # firing on a ticket question).
+                                #
+                                # Kill switch: JOURNAL_TYPE_MATCH_ENABLED=0
+                                import os as _os_tm
+                                type_match_enabled = (
+                                    _os_tm.environ.get(
+                                        "JOURNAL_TYPE_MATCH_ENABLED", "1"
+                                    ).strip() != "0"
+                                )
+                                entry_type = entry.get("question_type", "general")
+                                type_check_passed = True
+
+                                if type_match_enabled:
+                                    try:
+                                        type_plan = await self.agent.generate_unified_research_plan(
+                                            user_text=user_text,
+                                            context=context,
+                                            ticket_cache=self._ticket_cache,
+                                            memory_header=self._memory_header,
+                                            rewritten_query=(
+                                                rewritten_query
+                                                if rewritten_query
+                                                and rewritten_query != user_text
+                                                else ""
+                                            ),
+                                        )
+                                        if type_plan:
+                                            current_type = type_plan.get(
+                                                "question_type", "general"
+                                            )
+                                            if current_type != entry_type:
+                                                print(
+                                                    f"[{ts()}] {self.tag} 📔 Journal "
+                                                    f"type-mismatch: entry={entry_type}, "
+                                                    f"current={current_type} — rejecting "
+                                                    f"hit, falling through to fresh research"
+                                                )
+                                                type_check_passed = False
+                                                # Stash plan so the fresh-research
+                                                # path doesn't re-run the planner.
+                                                self._stashed_plan_for_v2 = type_plan
+                                    except __import__("asyncio").CancelledError:
+                                        raise
+                                    except Exception as _tm_e:
+                                        print(f"[{ts()}] {self.tag} ⚠️  Type-match "
+                                              f"check failed (non-fatal): "
+                                              f"{type(_tm_e).__name__}: {_tm_e}")
+
+                                if type_check_passed:
+                                    print(f"[{ts()}] {self.tag} 📔 Journal HIT: "
+                                          f"score={score:.3f}, type={entry_type}, "
+                                          f"data=(t={n_tickets},w={n_web}), "
+                                          f"q='{entry.get('question', '')[:50]}'")
+
+                                    # Step 3: fast PM with retrieved entry as context
+                                    try:
+                                        fast_result = await self._fast_pm_from_journal(
+                                            user_text=user_text,
+                                            rewritten_query=rewritten_query,
+                                            journal_entry=entry,
+                                            context=context,
+                                            my_gen=my_gen,
+                                            filler_duration=filler_duration,
+                                            filler_relay_start=filler_relay_start,
+                                        )
+                                        if fast_result is not None:
+                                            return fast_result
+                                        print(f"[{ts()}] {self.tag} ↪ Fast PM ESCALATEd — "
+                                              f"falling through to fresh research")
+                                    except __import__("asyncio").CancelledError:
+                                        raise
+                                    except Exception as e:
+                                        print(f"[{ts()}] {self.tag} ⚠️  Fast PM error: "
+                                              f"{type(e).__name__}: {e}")
+                                # else: type-mismatch path — fall through naturally
+                                #       to the fresh-research code below.
+                            else:
+                                print(f"[{ts()}] {self.tag} 📔 Journal weak hit "
+                                      f"(score={score:.3f} < {strict_thresh}, no data) — "
+                                      f"treating as miss")
+                        else:
+                            print(f"[{ts()}] {self.tag} 📔 Journal MISS for "
+                                  f"'{rewritten_query[:50]}' (size={journal.size})")
+                    else:
+                        print(f"[{ts()}] {self.tag} 📔 Journal empty — fresh research")
+                except Exception as e:
+                    print(f"[{ts()}] {self.tag} ⚠️  Journal lookup error: "
+                          f"{type(e).__name__}: {e}")
+
+        else:
+            # Fallback path: use Stage 2.5 single-slot cache
+            hit, reason = self._check_cache_hit(user_text)
+            print(f"[{ts()}] {self.tag} 💾 [LEGACY-2.5] Cache: "
+                  f"{'HIT' if hit else 'MISS'} — {reason}")
+            if hit:
+                try:
+                    fast_result = await self._fast_pm_with_research_cache(
+                        user_text=user_text,
+                        context=context,
+                        my_gen=my_gen,
+                        filler_duration=filler_duration,
+                        filler_relay_start=filler_relay_start,
+                    )
+                    if fast_result is not None:
+                        return fast_result
+                except __import__("asyncio").CancelledError:
+                    raise
+                except Exception as e:
+                    print(f"[{ts()}] {self.tag} ⚠️  Stage 2.5 fast PM error: {e}")
+
+        if self.interrupt_event.is_set() or my_gen != self.generation:
+            return None
+
+        # Step 1: Plan ----------------------------------------------------------
+        # Stage 2.11: reuse plan computed during type-match check above (if any).
+        # Otherwise compute fresh. The stashed plan is the same query/context
+        # we'd compute here anyway.
+        stashed = getattr(self, "_stashed_plan_for_v2", None)
+        if stashed is not None:
+            plan = stashed
+            self._stashed_plan_for_v2 = None  # consume
+            print(f"[{ts()}] {self.tag} 🔁 Reusing plan from type-match check")
+        else:
+            plan = await self.agent.generate_unified_research_plan(
+                user_text=user_text,
+                context=context,
+                ticket_cache=self._ticket_cache,
+                memory_header=self._memory_header,
+                rewritten_query=rewritten_query if rewritten_query and rewritten_query != user_text else "",
+            )
+        if not plan:
+            return None
+
+        qtype = plan.get("question_type", "general")
+        cached_refs = plan.get("relevant_cached_tickets", [])
+        needs_fresh = plan.get("needs_fresh_jira", False)
+        web_query = plan.get("web_search_query", "").strip()
+
+        # Stage 2.7: prefer rewritten_query over raw user_text for fallback.
+        # Production bug: "What are your hourly rates" was sent raw to Exa,
+        # which returned generic freelance pricing pages. Sam then synthesized
+        # those as if they were AnavClouds rates. The rewriter resolves to
+        # "AnavClouds Salesforce consulting hourly rates" — much better signal.
+        fallback_query = (rewritten_query if rewritten_query and
+                           rewritten_query != user_text else user_text).strip()[:200]
+
+        # internal_org: fetch both anyway (per design decision — synthesis sorts
+        # it out). Profile is always injected so this is safe.
+        if qtype == "internal_org":
+            needs_fresh = True
+            if not web_query or web_query.upper() == "SKIP":
+                web_query = fallback_query
+
+        print(f"[{ts()}] {self.tag} 🚪 Unified-v2: type={qtype}, "
+              f"cached_refs={len(cached_refs)}, fresh_jira={needs_fresh}, "
+              f"web={'YES' if web_query and web_query.upper() != 'SKIP' else 'NO'}")
+
+        if self.interrupt_event.is_set() or my_gen != self.generation:
+            return None
+
+        # Step 2: Always-needed blocks ------------------------------------------
+        agenda_block = self._build_agenda_block_for_prompt()
+        client_profile_block = self._build_client_profile_block_for_prompt()
+        memory_context = getattr(self, "_memory_full", "") or ""
+
+        # Step 3: Conditional parallel fetch ------------------------------------
+        # Jira: use _handle_jira_read (preserves transition/create/read intent)
+        # Web:  use _search_with_fallback (Exa → Brave per-call)
+
+        jira_task = None
+        web_task = None
+
+        # Stage 2.7: pass rewritten_query to Jira so "tell me about that
+        # ticket" can be resolved to "tell me about SCRUM-244" (extracts key).
+        effective_jira_text = (rewritten_query if rewritten_query and
+                                rewritten_query != user_text else user_text)
+
+        if needs_fresh and self.jira and self.jira.enabled:
+            async def _do_jira():
+                t0 = _t.time()
+                try:
+                    result = await self._handle_jira_read(effective_jira_text, context, my_gen)
+                    print(f"[{ts()}] {self.tag} ⏱ [JIRA-v2] _handle_jira_read: "
+                          f"{(_t.time()-t0)*1000:.0f}ms")
+                    return result
+                except Exception as e:
+                    print(f"[{ts()}] {self.tag} ⚠️  [JIRA-v2] failed: "
+                          f"{type(e).__name__}: {e}")
+                    return None
+            jira_task = __import__("asyncio").create_task(_do_jira())
+
+        if web_query and web_query.upper() != "SKIP":
+            async def _do_web():
+                t0 = _t.time()
+                try:
+                    results = await self._search_with_fallback(web_query)
+                    print(f"[{ts()}] {self.tag} ⏱ [WEB-v2] {len(results)} results: "
+                          f"{(_t.time()-t0)*1000:.0f}ms")
+                    return results
+                except Exception as e:
+                    print(f"[{ts()}] {self.tag} ⚠️  [WEB-v2] failed: "
+                          f"{type(e).__name__}: {e}")
+                    return []
+            web_task = __import__("asyncio").create_task(_do_web())
+
+        # Gather fetches in parallel
+        jira_action_result = None
+        web_results = []
+        if jira_task or web_task:
+            t_parallel = _t.time()
+            if jira_task:
+                jira_action_result = await jira_task
+            if web_task:
+                web_results = await web_task or []
+            print(f"[{ts()}] {self.tag} ⏱ [PARALLEL-v2] fetches done: "
+                  f"{(_t.time()-t_parallel)*1000:.0f}ms")
+
+        if self.interrupt_event.is_set() or my_gen != self.generation:
+            return None
+
+        # Step 4: Build project_context ----------------------------------------
+        # Update ticket cache with any fresh tickets from _handle_jira_read
+        fresh_tickets = []
+        if isinstance(jira_action_result, dict):
+            action = jira_action_result.get("action", "")
+
+            # Transition: update cache status in-place
+            if action == "transition":
+                tid = jira_action_result.get("ticket", "")
+                new_status = jira_action_result.get("new_status", "")
+                for t in self._ticket_cache:
+                    if t.get("key") == tid:
+                        t["status"] = new_status
+                        break
+                self._rebuild_jira_context()
+
+            # New tickets returned: add to cache
+            elif "tickets" in jira_action_result and isinstance(
+                jira_action_result["tickets"], list
+            ):
+                fresh_tickets = jira_action_result["tickets"]
+                existing_keys = {t.get("key") for t in self._ticket_cache}
+                for ft in fresh_tickets:
+                    if ft.get("key") and ft["key"] not in existing_keys:
+                        self._ticket_cache.append(ft)
+                        existing_keys.add(ft["key"])
+
+            # Single ticket returned (no "tickets" wrapper)
+            elif "key" in jira_action_result:
+                fresh_tickets = [jira_action_result]
+                if jira_action_result["key"] not in [
+                    t.get("key") for t in self._ticket_cache
+                ]:
+                    self._update_ticket_cache(jira_action_result)
+
+        # Build project_context: cached refs + fresh tickets
+        relevant_tickets = []
+        cached_keys_set = set(cached_refs)
+        if cached_keys_set:
+            for t in self._ticket_cache:
+                if t.get("key") in cached_keys_set:
+                    relevant_tickets.append(t)
+        for ft in fresh_tickets:
+            if ft.get("key") and ft.get("key") not in [
+                rt.get("key") for rt in relevant_tickets
+            ]:
+                relevant_tickets.append(ft)
+
+        if relevant_tickets:
+            ctx_lines = []
+            for t in relevant_tickets[:8]:
+                key = t.get("key", "?")
+                summary = (t.get("summary") or "").strip()[:120]
+                status = t.get("status") or "?"
+                ctx_lines.append(f"- {key} [{status}]: {summary}")
+            project_context = "\n".join(ctx_lines)
+        else:
+            project_context = self._jira_context or ""
+
+        # If a Jira action happened (transition / already_done / error), surface
+        # it inside project_context so synthesis can acknowledge it
+        if isinstance(jira_action_result, dict):
+            act = jira_action_result.get("action", "")
+            if act in ("transition", "already_done", "transition_error"):
+                tid = jira_action_result.get("ticket", "?")
+                if act == "transition":
+                    note = (
+                        f"\n\n[ACTION TAKEN] {tid} moved to "
+                        f"'{jira_action_result.get('new_status', '?')}'"
+                    )
+                elif act == "already_done":
+                    note = (
+                        f"\n\n[ACTION] {tid} was already at "
+                        f"'{jira_action_result.get('already_at', '?')}'"
+                    )
+                else:
+                    note = (
+                        f"\n\n[ACTION FAILED] {tid}: "
+                        f"{jira_action_result.get('error', 'unknown')}"
+                    )
+                project_context = (project_context or "") + note
+
+        # Step 5: Synthesis ----------------------------------------------------
+        research_queue = __import__("asyncio").Queue()
+        synth_task = __import__("asyncio").create_task(
+            self.agent.unified_synthesis_to_queue(
+                user_text=user_text,
+                project_context=project_context,
+                web_results=web_results,
+                agenda_block=agenda_block,
+                client_profile_block=client_profile_block,
+                conversation=context,
+                memory_context=memory_context,
+                azure_extractor=self.azure_extractor,
+                queue=research_queue,
+                length="70-90 words across 4-5 sentences",
+            )
+        )
+
+        # Step 6: Stream -------------------------------------------------------
+        if self._streaming_mode:
+            all_sentences, interrupted = await self._stream_pipelined(
+                research_queue, my_gen, cancel_task=synth_task,
+                extra_duration=filler_duration,
+                relay_start_override=filler_relay_start,
+            )
+            # Sanity: if synthesis produced nothing usable, signal failure so
+            # caller can fall through to legacy block
+            if not all_sentences and not interrupted:
+                print(f"[{ts()}] {self.tag} ⚠️  Unified-v2 produced no sentences — "
+                      f"falling back to legacy")
+                return None
+
+            # Stage 2.6: append research to journal (RAG cache for follow-ups)
+            # Stage 2.5 cache also updated as fallback if journal disabled.
+            try:
+                synthesis_text = " ".join(all_sentences) if all_sentences else ""
+
+                # Stage 2.10 Bug B: include cached refs in journal
+                # When planner used cached_refs without fresh_jira, fresh_tickets
+                # is empty even though SCRUM-244 (etc.) was in the answer. Pull
+                # those from self._ticket_cache so the journal entry has actual
+                # data instead of being empty (which causes downstream stalls).
+                relevant_tickets = []
+                cached_refs = plan.get("relevant_cached_tickets", []) or []
+                for key in cached_refs:
+                    for t in (self._ticket_cache or []):
+                        if t.get("key") == key:
+                            relevant_tickets.append(t)
+                            break
+                # Add fresh tickets, dedupe by key
+                seen_keys = {t.get("key") for t in relevant_tickets if t.get("key")}
+                for ft in (fresh_tickets or []):
+                    if ft.get("key") and ft.get("key") not in seen_keys:
+                        relevant_tickets.append(ft)
+                        seen_keys.add(ft.get("key"))
+
+                # Stage 2.6: journal entry (now with cached refs included)
+                journal = getattr(self.agent, "journal", None)
+                if journal is not None:
+                    entry = {
+                        "question": rewritten_query if "rewritten_query" in locals() else user_text,
+                        "raw_question": user_text,
+                        "synthesis_output": synthesis_text[:1500],
+                        "jira_tickets": relevant_tickets[:8],
+                        "web_results": (web_results or [])[:4],
+                        "question_type": plan.get("question_type", "general"),
+                    }
+                    await journal.add(entry)
+
+                # Stage 2.5: also update single-slot for kill-switch fallback
+                self._update_research_cache(
+                    user_text=user_text,
+                    plan=plan,
+                    fresh_tickets=fresh_tickets,
+                    web_results=web_results,
+                    synthesis_output=synthesis_text,
+                )
+            except Exception as e:
+                print(f"[{ts()}] {self.tag} ⚠️  Journal/cache update failed (non-fatal): "
+                      f"{type(e).__name__}: {e}")
+
+            return (all_sentences, interrupted)
+        else:
+            spoken: list = []
+            asyncio = __import__("asyncio")
+            while True:
+                try:
+                    item = await asyncio.wait_for(research_queue.get(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    break
+                if item is None:
+                    break
+                spoken.append(item)
+            if not spoken:
+                return None
+
+            # Stage 2.6 + 2.10 Bug B: append research to journal (non-streaming)
+            try:
+                synthesis_text = " ".join(spoken) if spoken else ""
+
+                # Stage 2.10 Bug B: include cached refs in journal
+                relevant_tickets_ns = []
+                cached_refs_ns = plan.get("relevant_cached_tickets", []) or []
+                for key in cached_refs_ns:
+                    for t in (self._ticket_cache or []):
+                        if t.get("key") == key:
+                            relevant_tickets_ns.append(t)
+                            break
+                seen_keys_ns = {t.get("key") for t in relevant_tickets_ns if t.get("key")}
+                for ft in (fresh_tickets or []):
+                    if ft.get("key") and ft.get("key") not in seen_keys_ns:
+                        relevant_tickets_ns.append(ft)
+                        seen_keys_ns.add(ft.get("key"))
+
+                journal = getattr(self.agent, "journal", None)
+                if journal is not None:
+                    entry = {
+                        "question": rewritten_query if "rewritten_query" in locals() else user_text,
+                        "raw_question": user_text,
+                        "synthesis_output": synthesis_text[:1500],
+                        "jira_tickets": relevant_tickets_ns[:8],
+                        "web_results": (web_results or [])[:4],
+                        "question_type": plan.get("question_type", "general"),
+                    }
+                    await journal.add(entry)
+
+                # Stage 2.5 fallback
+                self._update_research_cache(
+                    user_text=user_text,
+                    plan=plan,
+                    fresh_tickets=fresh_tickets,
+                    web_results=web_results,
+                    synthesis_output=synthesis_text,
+                )
+            except Exception as e:
+                print(f"[{ts()}] {self.tag} ⚠️  Journal/cache update failed (non-fatal): "
+                      f"{type(e).__name__}: {e}")
+
+            for sent in spoken:
+                if self.interrupt_event.is_set() or my_gen != self.generation:
+                    return (spoken, True)
+                await self._speak(sent, "research", my_gen)
+            return (spoken, False)
+
+    async def _search_with_fallback(self, query: str) -> list:
+        """Exa → Brave fallback for web search. Returns normalized list of dicts.
+
+        Tries Exa first (when enabled and not circuit-broken). On empty/error,
+        falls back to Brave. Output is always a list[dict] with keys
+        {title, url, content, published_date} ready for unified synthesis.
+
+        Respects RESEARCH_PROVIDER:
+          - "exa"   (or anything but "brave") → try Exa, fall back to Brave
+          - "brave"                            → Brave only
+
+        Returns [] if both fail / both disabled.
+        """
+        import time as _t
+
+        # If user pinned RESEARCH_PROVIDER=brave, skip Exa entirely
+        try_exa = (RESEARCH_PROVIDER != "brave")
+
+        # ── Try Exa ──
+        if try_exa:
+            try:
+                exa_search = self.agent._get_exa_search()
+                if exa_search.enabled and exa_search.consecutive_failures < 3:
+                    t0 = _t.time()
+                    exa_results = await exa_search.search(query, num_results=5)
+                    print(f"[{ts()}] {self.tag} ⏱ Exa: "
+                          f"{(_t.time()-t0)*1000:.0f}ms "
+                          f"({len(exa_results) if exa_results else 0} results)")
+                    if exa_results:
+                        return exa_results
+                else:
+                    print(f"[{ts()}] {self.tag} ⚠️  Exa disabled or circuit-broken "
+                          f"({exa_search.consecutive_failures} failures)")
+            except Exception as e:
+                print(f"[{ts()}] {self.tag} ⚠️  Exa error, falling back to Brave: "
+                      f"{type(e).__name__}: {e}")
+
+        # ── Fall back to Brave (returns string, wrap as single dict) ──
+        try:
+            web_search = self.agent._get_web_search()
+            t0 = _t.time()
+            brave_text = await web_search.search(query)
+            print(f"[{ts()}] {self.tag} ⏱ Brave: "
+                  f"{(_t.time()-t0)*1000:.0f}ms "
+                  f"({len(brave_text) if brave_text else 0} chars)")
+            if brave_text:
+                return [{
+                    "title": "Web search results",
+                    "url": "",
+                    "content": brave_text,
+                    "published_date": "",
+                }]
+        except Exception as e:
+            print(f"[{ts()}] {self.tag} ⚠️  Brave error: "
+                  f"{type(e).__name__}: {e}")
+
+        return []
+
+    # ── Stage 2.5: research context cache ────────────────────────────────────
+
+    @staticmethod
+    def _make_empty_cache():
+        """Initial cache state — populated after each successful research turn."""
+        return {
+            "fetched_at": 0.0,            # time.time() when populated
+            "topic_keywords": set(),       # significant words from the question
+            "jira_tickets": [],            # list[dict] — fresh tickets from research
+            "web_results": [],             # list[dict] — Exa/Brave results
+            "synthesis_output": "",        # what Sam said (for "as I mentioned")
+            "last_question_type": "general",  # planner question_type — drives TTL
+        }
+
+    # TTL by question type — how long cached context stays fresh
+    _CACHE_TTL_BY_TYPE = {
+        "jira_status":     30,    # status changes — short TTL
+        "general":         300,   # 5 min default
+        "feasibility":     1800,  # 30 min — stable reasoning
+        "tech_switch":     1800,
+        "best_practices":  1800,
+        "internal_org":    3600,  # 1 hr — company info is stable
+    }
+
+    @staticmethod
+    def _extract_topic_keywords(text: str) -> set:
+        """Pure-Python keyword extraction — no LLM call.
+
+        Returns a set of significant words (3+ chars, not stop-words),
+        plus any ticket keys (e.g. SCRUM-244) found in the text.
+        """
+        import re as _re
+
+        STOP_WORDS = {
+            "the", "and", "but", "for", "with", "this", "that", "have", "has",
+            "had", "are", "was", "were", "been", "being", "what", "when",
+            "where", "which", "who", "whom", "whose", "why", "how", "all",
+            "any", "both", "each", "few", "more", "most", "other", "some",
+            "such", "than", "too", "very", "can", "will", "just", "should",
+            "would", "could", "may", "might", "must", "ought", "shall",
+            "tell", "about", "give", "show", "make", "did", "does", "doing",
+            "from", "into", "onto", "upon", "over", "under", "out", "off",
+            "yes", "yeah", "okay", "actually", "really", "sure", "right",
+            "you", "your", "yours", "his", "her", "hers", "its", "our",
+            "ours", "their", "theirs", "they", "them", "him", "she", "we",
+        }
+
+        if not text:
+            return set()
+
+        # Extract ticket keys (preserve case)
+        ticket_keys = set(_re.findall(r"\b[A-Z]+-\d+\b", text.upper()))
+
+        # Extract regular words
+        words = _re.findall(r"\b[a-zA-Z]{3,}\b", text.lower())
+        keywords = {w for w in words if w not in STOP_WORDS}
+
+        return keywords | ticket_keys
+
+    def _check_cache_hit(self, user_text: str):
+        """Heuristic cache hit/miss decision — no LLM call, ~1ms.
+
+        Returns (hit: bool, reason: str) — reason is logged for visibility.
+
+        Hit conditions (all must be true):
+          - Cache is populated (fetched_at > 0)
+          - Cache is fresh (age < TTL for last_question_type)
+          - User's question doesn't reference a NEW ticket key
+          - User's question doesn't shift to a new topic (3+ new keywords)
+
+        Conservative: when in doubt, miss. ESCALATE handles the false positives.
+        """
+        import time as _t
+        import re as _re
+        import os as _os
+
+        # Allow runtime opt-out for debugging / A/B testing
+        if _os.environ.get("RESEARCH_CACHE_ENABLED", "1").strip() == "0":
+            return (False, "cache disabled by env")
+
+        cache = self._research_cache
+        fetched_at = cache.get("fetched_at", 0.0)
+        if fetched_at <= 0:
+            return (False, "cache empty")
+
+        age = _t.time() - fetched_at
+        last_type = cache.get("last_question_type", "general")
+        ttl = self._CACHE_TTL_BY_TYPE.get(last_type, 300)
+        if age > ttl:
+            return (False, f"stale (age={age:.0f}s > ttl={ttl}s for {last_type})")
+
+        # New ticket key check
+        question_keys = set(_re.findall(r"\b[A-Z]+-\d+\b", user_text.upper()))
+        cached_keys = {
+            t.get("key") for t in cache.get("jira_tickets", []) if t.get("key")
+        }
+        new_keys = question_keys - cached_keys
+        if new_keys:
+            return (False, f"new ticket key(s): {sorted(new_keys)}")
+
+        # Topic shift check (lenient — short follow-ups have few new words)
+        current_kws = self._extract_topic_keywords(user_text)
+        cached_kws = cache.get("topic_keywords", set())
+        new_kws = current_kws - cached_kws
+        if len(new_kws) >= 3 and len(current_kws) >= 4:
+            return (False, f"topic shift ({len(new_kws)} new keywords)")
+
+        return (True, f"hit (age={age:.0f}s, type={last_type})")
+
+    async def _fast_pm_from_journal(self, user_text: str, rewritten_query: str,
+                                     journal_entry: dict, context: str,
+                                     my_gen: int, filler_duration: float,
+                                     filler_relay_start: float):
+        """Stage 2.6: fast PM using a journal entry as cached context.
+
+        Mirrors _fast_pm_with_research_cache but pulls data from a single
+        retrieved journal entry instead of self._research_cache. The entry
+        was selected by semantic search on the rewritten query.
+
+        Returns:
+          (all_sentences, interrupted) on success
+          None on ESCALATE or error → caller does fresh research
+
+        ESCALATE detection on first 15 chars (same as Stage 2.5).
+        """
+        import time as _t
+        import re as _re
+        import asyncio
+
+        try:
+            # Stage S: unified PM_PROMPT_V2 (base + cached-context suffix).
+            # Same output as the old FAST_PM_CACHED_PROMPT alias.
+            from Agent import PM_PROMPT_V2_BASE, PM_PROMPT_V2_CACHED_SUFFIX
+        except ImportError as e:
+            print(f"[{ts()}] {self.tag} ⚠️  PM_PROMPT_V2 import failed: {e}")
+            return None
+
+        cache_age = max(0, int(_t.time() - journal_entry.get("fetched_at", 0)))
+
+        # Format cached tickets
+        tickets = journal_entry.get("jira_tickets") or []
+        cached_tickets_text = "(no cached tickets)"
+        if tickets:
+            lines = []
+            for t in tickets[:8]:
+                key = t.get("key", "?")
+                summary = (t.get("summary") or "").strip()[:120]
+                status = t.get("status") or "?"
+                lines.append(f"- {key} [{status}]: {summary}")
+            if lines:
+                cached_tickets_text = "\n".join(lines)
+
+        # Format cached web results
+        web = journal_entry.get("web_results") or []
+        cached_web_text = "(no cached web results)"
+        if web:
+            web_lines = []
+            for i, r in enumerate(web[:4], 1):
+                title = (r.get("title") or "").strip()
+                content = (r.get("content") or "").strip()[:300]
+                if not content:
+                    continue
+                line = f"[{i}]"
+                if title:
+                    line += f" {title}"
+                line += f": {content}"
+                web_lines.append(line)
+            if web_lines:
+                cached_web_text = "\n\n".join(web_lines)
+
+        cached_synthesis = (journal_entry.get("synthesis_output") or "").strip()
+        if not cached_synthesis:
+            cached_synthesis = "(no prior response on this topic)"
+
+        # Conversation block — last 3 turns
+        if context:
+            conv_lines = [
+                l for l in context.strip().split("\n") if l.strip()
+            ][-3:]
+            conversation_block = "\n".join(conv_lines) if conv_lines else "(start of call)"
+        else:
+            conversation_block = "(start of call)"
+
+        # Always-injected blocks (Stage 1)
+        agenda_block = self._build_agenda_block_for_prompt() or "(no fixed agenda for today)"
+        client_profile_block = self._build_client_profile_block_for_prompt() or "(no client profile loaded)"
+
+        system = (PM_PROMPT_V2_BASE + "\n\n" + PM_PROMPT_V2_CACHED_SUFFIX).format(
+            client_profile_block=client_profile_block,
+            agenda_block=agenda_block,
+            cached_tickets=cached_tickets_text,
+            cached_web=cached_web_text,
+            cached_synthesis=cached_synthesis,
+            conversation_block=conversation_block,
+            question=user_text,
+            cache_age_sec=cache_age,
+        )
+
+        print(f"[{ts()}] {self.tag} 🚀 Fast PM (journal): prompt={len(system)} chars, "
+              f"age={cache_age}s, tickets={len(tickets)}, web={len(web)}, "
+              f"rewritten='{rewritten_query[:50]}'")
+
+        if self.interrupt_event.is_set() or my_gen != self.generation:
+            return None
+
+        t0 = _t.time()
+        try:
+            stream = await self.agent.client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_text},
+                ],
+                temperature=0.5,
+                max_tokens=200,
+                stream=True,
+            )
+        except Exception as e:
+            print(f"[{ts()}] {self.tag} ⚠️  Fast PM (journal) stream open failed: "
+                  f"{type(e).__name__}: {e}")
+            return None
+
+        research_queue: asyncio.Queue = asyncio.Queue()
+        escalated = {"flag": False}
+        escalate_re = _re.compile(r"^ESCALATE[\s.!?]*$", _re.IGNORECASE)
+
+        async def _consume_and_stream():
+            sentence_buf = ""
+            full = ""
+            escalate_window = ""
+            window_done = False
+            first_token = False
+            sentence_count = 0
+
+            try:
+                async for chunk in stream:
+                    token = chunk.choices[0].delta.content if chunk.choices else None
+                    if not token:
+                        continue
+                    full += token
+
+                    if not first_token:
+                        first_token = True
+                        print(f"[{ts()}] {self.tag} ⏱ Fast PM (journal) first token: "
+                              f"{(_t.time()-t0)*1000:.0f}ms")
+
+                    if not window_done:
+                        escalate_window += token
+                        # Stage 2.10 Checkpoint 3: extend window to 80 chars to
+                        # also detect stall phrases like "let me check on Jira".
+                        # ESCALATE check still uses the strict first-15-char rule.
+                        if len(escalate_window) >= 80 or "\n" in escalate_window:
+                            window_done = True
+                            stripped = escalate_window.strip()
+                            # Strict ESCALATE check (first 15 chars only)
+                            if escalate_re.match(stripped[:30]):
+                                escalated["flag"] = True
+                                print(f"[{ts()}] {self.tag} 🔄 Fast PM ESCALATE "
+                                      f"at {(_t.time()-t0)*1000:.0f}ms")
+                                return
+                            # Stage 2.10 Checkpoint 3: stall-phrase check
+                            is_stall, stall_phrase = BotSession._is_stall_response(stripped)
+                            if is_stall:
+                                escalated["flag"] = True
+                                print(f"[{ts()}] {self.tag} 🛑 Fast PM stall "
+                                      f"detected: '{stall_phrase}' — "
+                                      f"falling through to fresh research")
+                                return
+                            sentence_buf = escalate_window
+                        else:
+                            continue
+                    else:
+                        sentence_buf += token
+
+                    while ". " in sentence_buf or "? " in sentence_buf or "! " in sentence_buf:
+                        for sep in [". ", "? ", "! "]:
+                            idx = sentence_buf.find(sep)
+                            if idx != -1:
+                                sentence = sentence_buf[:idx + 1].strip()
+                                sentence_buf = sentence_buf[idx + 2:]
+                                if sentence:
+                                    sentence_count += 1
+                                    print(f"[{ts()}] {self.tag} ⏱ Fast PM (journal) "
+                                          f"sentence {sentence_count}: "
+                                          f"{(_t.time()-t0)*1000:.0f}ms")
+                                    await research_queue.put(sentence)
+                                break
+
+                if sentence_buf.strip() and not escalated["flag"]:
+                    await research_queue.put(sentence_buf.strip())
+
+                if full and not escalated["flag"]:
+                    self.agent.history.append({"role": "user", "content": user_text})
+                    self.agent.history.append({"role": "assistant", "content": full})
+                    if len(self.agent.history) > 6:
+                        self.agent.history = self.agent.history[-6:]
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[{ts()}] {self.tag} ⚠️  Fast PM (journal) consume error: "
+                      f"{type(e).__name__}: {e}")
+            finally:
+                await research_queue.put(None)
+
+        consume_task = asyncio.create_task(_consume_and_stream())
+
+        if self._streaming_mode:
+            all_sentences, interrupted = await self._stream_pipelined(
+                research_queue, my_gen, cancel_task=consume_task,
+                extra_duration=filler_duration,
+                relay_start_override=filler_relay_start,
+            )
+            if escalated["flag"]:
+                return None
+            if not all_sentences and not interrupted:
+                return None
+            return (all_sentences, interrupted)
+        else:
+            spoken: list = []
+            while True:
+                try:
+                    item = await asyncio.wait_for(research_queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    break
+                if item is None:
+                    break
+                spoken.append(item)
+
+            if escalated["flag"] or not spoken:
+                return None
+
+            for sent in spoken:
+                if self.interrupt_event.is_set() or my_gen != self.generation:
+                    return (spoken, True)
+                await self._speak(sent, "research", my_gen)
+            return (spoken, False)
+
+    async def _fast_pm_with_research_cache(self, user_text: str, context: str,
+                                            my_gen: int, filler_duration: float,
+                                            filler_relay_start: float):
+        """Cache-hit fast lane: PM-style response from cached context.
+
+        Uses Groq llama-3.3-70b (faster + cheaper than Azure 4o-mini for the
+        relatively-small reasoning task of "use cached data to answer follow-up").
+
+        ESCALATE detection: buffers first 15 chars of model output. If the
+        response starts with "ESCALATE" (followed by punctuation or end), the
+        fast path returns None — caller falls through to fresh research.
+
+        Returns:
+          (all_sentences, interrupted) tuple on success
+          None on ESCALATE or any error → caller does fresh research
+
+        Always-injected blocks (Stage 1 fix carries through):
+          - client_profile_block (real names only, no Tom/Rohan)
+          - agenda_block
+        """
+        import time as _t
+        import re as _re
+        import asyncio
+        import sys as _sys
+
+        try:
+            # Stage S: unified PM_PROMPT_V2 (base + cached-context suffix).
+            # Same output as the old FAST_PM_CACHED_PROMPT alias.
+            from Agent import PM_PROMPT_V2_BASE, PM_PROMPT_V2_CACHED_SUFFIX
+        except ImportError as e:
+            print(f"[{ts()}] {self.tag} ⚠️  PM_PROMPT_V2 import failed: {e}")
+            return None
+
+        cache = self._research_cache
+        cache_age = max(0, int(_t.time() - cache.get("fetched_at", 0)))
+
+        # Format cached tickets
+        cached_tickets_text = "(no cached tickets)"
+        if cache.get("jira_tickets"):
+            lines = []
+            for t in cache["jira_tickets"][:8]:
+                key = t.get("key", "?")
+                summary = (t.get("summary") or "").strip()[:120]
+                status = t.get("status") or "?"
+                lines.append(f"- {key} [{status}]: {summary}")
+            if lines:
+                cached_tickets_text = "\n".join(lines)
+
+        # Format cached web results
+        cached_web_text = "(no cached web results)"
+        if cache.get("web_results"):
+            web_lines = []
+            for i, r in enumerate(cache["web_results"][:4], 1):
+                title = (r.get("title") or "").strip()
+                content = (r.get("content") or "").strip()[:300]
+                if not content:
+                    continue
+                line = f"[{i}]"
+                if title:
+                    line += f" {title}"
+                line += f": {content}"
+                web_lines.append(line)
+            if web_lines:
+                cached_web_text = "\n\n".join(web_lines)
+
+        cached_synthesis = (cache.get("synthesis_output") or "").strip()
+        if not cached_synthesis:
+            cached_synthesis = "(no prior response in this conversation)"
+
+        # Conversation block
+        if context:
+            conv_lines = [
+                l for l in context.strip().split("\n") if l.strip()
+            ][-3:]
+            conversation_block = "\n".join(conv_lines) if conv_lines else "(start of call)"
+        else:
+            conversation_block = "(start of call)"
+
+        # Always-injected blocks (Stage 1 carries through)
+        agenda_block = self._build_agenda_block_for_prompt() or "(no fixed agenda for today)"
+        client_profile_block = self._build_client_profile_block_for_prompt() or "(no client profile loaded)"
+
+        system = (PM_PROMPT_V2_BASE + "\n\n" + PM_PROMPT_V2_CACHED_SUFFIX).format(
+            client_profile_block=client_profile_block,
+            agenda_block=agenda_block,
+            cached_tickets=cached_tickets_text,
+            cached_web=cached_web_text,
+            cached_synthesis=cached_synthesis,
+            conversation_block=conversation_block,
+            question=user_text,
+            cache_age_sec=cache_age,
+        )
+
+        print(f"[{ts()}] {self.tag} 🚀 Fast PM cache: prompt={len(system)} chars, "
+              f"age={cache_age}s, tickets={len(cache.get('jira_tickets', []))}, "
+              f"web={len(cache.get('web_results', []))}")
+
+        if self.interrupt_event.is_set() or my_gen != self.generation:
+            return None
+
+        # ── Open Groq llama-3.3-70b stream ──
+        t0 = _t.time()
+        try:
+            stream = await self.agent.client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_text},
+                ],
+                temperature=0.5,
+                max_tokens=200,
+                stream=True,
+            )
+        except Exception as e:
+            print(f"[{ts()}] {self.tag} ⚠️  Fast PM stream open failed: "
+                  f"{type(e).__name__}: {e}")
+            return None
+
+        # ── Consume + ESCALATE detect + sentence stream ──
+        research_queue: asyncio.Queue = asyncio.Queue()
+        escalated = {"flag": False}  # mutable so closure can flip it
+
+        # Regex matches "ESCALATE" alone, or with trailing punctuation
+        escalate_re = _re.compile(r"^ESCALATE[\s.!?]*$", _re.IGNORECASE)
+
+        async def _consume_and_stream():
+            sentence_buf = ""
+            full = ""
+            escalate_window = ""
+            window_done = False
+            first_token = False
+            sentence_count = 0
+
+            try:
+                async for chunk in stream:
+                    token = chunk.choices[0].delta.content if chunk.choices else None
+                    if not token:
+                        continue
+                    full += token
+
+                    if not first_token:
+                        first_token = True
+                        print(f"[{ts()}] {self.tag} ⏱ Fast PM first token: "
+                              f"{(_t.time()-t0)*1000:.0f}ms")
+
+                    # ── Phase 1: ESCALATE detection on first 15 chars ──
+                    if not window_done:
+                        escalate_window += token
+                        # Window closes at 15 chars OR on newline
+                        if len(escalate_window) >= 15 or "\n" in escalate_window:
+                            window_done = True
+                            stripped = escalate_window.strip()
+                            if escalate_re.match(stripped):
+                                escalated["flag"] = True
+                                print(f"[{ts()}] {self.tag} 🔄 Fast PM ESCALATE "
+                                      f"detected at {(_t.time()-t0)*1000:.0f}ms — "
+                                      f"falling through to research")
+                                return  # finally clause puts None
+                            # Not escalate — start streaming sentences
+                            sentence_buf = escalate_window
+                        else:
+                            continue  # still buffering ESCALATE window
+
+                    else:
+                        sentence_buf += token
+
+                    # ── Phase 2: sentence streaming ──
+                    while ". " in sentence_buf or "? " in sentence_buf or "! " in sentence_buf:
+                        for sep in [". ", "? ", "! "]:
+                            idx = sentence_buf.find(sep)
+                            if idx != -1:
+                                sentence = sentence_buf[:idx + 1].strip()
+                                sentence_buf = sentence_buf[idx + 2:]
+                                if sentence:
+                                    sentence_count += 1
+                                    print(f"[{ts()}] {self.tag} ⏱ Fast PM sentence "
+                                          f"{sentence_count}: "
+                                          f"{(_t.time()-t0)*1000:.0f}ms")
+                                    await research_queue.put(sentence)
+                                break
+
+                # Stream finished — flush remainder
+                if sentence_buf.strip() and not escalated["flag"]:
+                    await research_queue.put(sentence_buf.strip())
+
+                # Update cache + history with this PM response
+                if full and not escalated["flag"]:
+                    self._research_cache["synthesis_output"] = full
+                    self.agent.history.append({"role": "user", "content": user_text})
+                    self.agent.history.append({"role": "assistant", "content": full})
+                    if len(self.agent.history) > 6:
+                        self.agent.history = self.agent.history[-6:]
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[{ts()}] {self.tag} ⚠️  Fast PM consume error: "
+                      f"{type(e).__name__}: {e}")
+            finally:
+                await research_queue.put(None)
+
+        consume_task = asyncio.create_task(_consume_and_stream())
+
+        # ── Stream sentences to TTS ──
+        if self._streaming_mode:
+            all_sentences, interrupted = await self._stream_pipelined(
+                research_queue, my_gen, cancel_task=consume_task,
+                extra_duration=filler_duration,
+                relay_start_override=filler_relay_start,
+            )
+
+            if escalated["flag"]:
+                return None
+
+            if not all_sentences and not interrupted:
+                # Empty stream + no interrupt — treat as failure
+                return None
+
+            return (all_sentences, interrupted)
+        else:
+            spoken: list = []
+            while True:
+                try:
+                    item = await asyncio.wait_for(research_queue.get(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    break
+                if item is None:
+                    break
+                spoken.append(item)
+
+            if escalated["flag"] or not spoken:
+                return None
+
+            for sent in spoken:
+                if self.interrupt_event.is_set() or my_gen != self.generation:
+                    return (spoken, True)
+                await self._speak(sent, "research", my_gen)
+            return (spoken, False)
+
+    def _update_research_cache(self, user_text: str, plan: dict,
+                                fresh_tickets: list, web_results: list,
+                                synthesis_output: str):
+        """Populate the research cache after a successful research turn.
+
+        Called from _unified_research_v2 after streaming completes. Replaces
+        the cache wholesale (latest research wins) — multi-topic merging is
+        future work.
+        """
+        import time as _t
+
+        # Topic keywords from the question that triggered this research
+        topic_kws = self._extract_topic_keywords(user_text)
+
+        # Combine cached + fresh tickets, dedupe by key
+        all_tickets_by_key = {}
+        for t in (self._ticket_cache or []):
+            if t.get("key"):
+                all_tickets_by_key[t["key"]] = t
+        for ft in (fresh_tickets or []):
+            if ft.get("key"):
+                all_tickets_by_key[ft["key"]] = ft
+
+        # Keep only the most relevant — cap to avoid prompt bloat
+        relevant = []
+        cached_refs = set(plan.get("relevant_cached_tickets", []))
+        for k, t in all_tickets_by_key.items():
+            if k in cached_refs or t in (fresh_tickets or []):
+                relevant.append(t)
+        relevant = relevant[:8]
+
+        self._research_cache = {
+            "fetched_at": _t.time(),
+            "topic_keywords": topic_kws,
+            "jira_tickets": relevant,
+            "web_results": (web_results or [])[:4],
+            "synthesis_output": (synthesis_output or "").strip()[:1500],
+            "last_question_type": plan.get("question_type", "general"),
+        }
+
+        print(f"[{ts()}] {self.tag} 💾 Cache updated: "
+              f"tickets={len(self._research_cache['jira_tickets'])}, "
+              f"web={len(self._research_cache['web_results'])}, "
+              f"synthesis={len(self._research_cache['synthesis_output'])} chars, "
+              f"type={self._research_cache['last_question_type']}, "
+              f"keywords={len(topic_kws)}")
 
     # ── Jira handler ──────────────────────────────────────────────────────────
 
@@ -3555,19 +5473,15 @@ class BotSession:
                     memory_context=self._memory_full,
                 ))
 
-            # Dynamic filler task (only consumed if route=RESEARCH).
-            # PREFERRED: Use pre-fired filler from _run_eot_check (started
-            # ~200-400ms earlier — has time to finish before router does).
-            # FALLBACK: Fire a new one inline if EOT didn't fire one
-            # (e.g., EARLY_FILLER_FIRE disabled, EOT path bypassed, or
-            # text mismatch from straggler words).
-            filler_task = None
-            if USE_DYNAMIC_FILLERS:
-                filler_task = self._consume_pending_filler(text)
-                if filler_task is None:
-                    # No pre-fired filler available — fire one now (old behavior)
-                    filler_task = asyncio.create_task(
-                        self.agent.generate_dynamic_filler(text))
+            # Ship 4: Dynamic filler is now PRE-FIRED at EOT-decides-RESPOND
+            # (in self._pending_filler_task), running in parallel with NLU,
+            # Policy, Router. We just consume it here. By router time, the
+            # task has been running ~1.5-2s — almost always ready.
+            #
+            # Pull it from session state and clear the slot so subsequent
+            # turns don't see stale data.
+            filler_task = self._pending_filler_task
+            self._pending_filler_task = None
 
             route = await router_task
             print(f"[{ts()}] {self.tag} Route: [{route}] ({elapsed(t1)})")
@@ -3580,11 +5494,15 @@ class BotSession:
                 except (asyncio.CancelledError, Exception):
                     pass
 
-                # ── Dynamic filler: use if ready + valid, else fall back ──
+                # ── Dynamic filler: use if pre-fired task is ready + valid ──
+                # Wait briefly (up to 800ms) if task is still running. Combined
+                # with the head start from EOT-RESPOND, total budget is ~2-3s
+                # which fits well within Groq's typical 600-1500ms latency.
                 self.searching = True
                 dynamic_filler_text = None
                 if filler_task is not None:
                     if filler_task.done():
+                        # Task finished while pipeline was running — best case
                         try:
                             result = filler_task.result()
                             if result:  # None = generation failed/invalid
@@ -3592,10 +5510,18 @@ class BotSession:
                         except (asyncio.CancelledError, Exception):
                             pass
                     else:
-                        # Not ready — don't wait for it (defeats the purpose)
-                        filler_task.cancel()
+                        # Still running — wait briefly to give it a chance
                         try:
-                            await filler_task
+                            result = await asyncio.wait_for(filler_task, timeout=0.8)
+                            if result:
+                                dynamic_filler_text = result
+                        except asyncio.TimeoutError:
+                            # Took too long — kill it, fall back to hardcoded
+                            filler_task.cancel()
+                            try:
+                                await filler_task
+                            except (asyncio.CancelledError, Exception):
+                                pass
                         except (asyncio.CancelledError, Exception):
                             pass
 
@@ -3622,15 +5548,41 @@ class BotSession:
                 t_research = _time.time()
 
                 # ═══════════════════════════════════════════════════════════════
-                # UNIFIED RESEARCH FLOW (Feature 4)
-                # Toggle: USE_UNIFIED_RESEARCH env var. If False/fails, falls back
-                # to legacy parallel Jira+web+Azure flow below.
+                # UNIFIED RESEARCH FLOW (Feature 4 + Stage 2)
+                # Three-tier fallback chain:
+                #   1. Stage 2: unified-v2 research path (RESEARCH_ARCHITECTURE)
+                #   2. Feature 4: unified research flow (USE_UNIFIED_RESEARCH)
+                #   3. Legacy: parallel Jira+web+Azure (always available)
+                # Each tier returns None on failure → next tier runs.
                 # ═══════════════════════════════════════════════════════════════
                 used_unified = False
                 all_sentences: list = []
                 interrupted = False
 
-                if USE_UNIFIED_RESEARCH:
+                # ── Tier 1: Stage 2 unified-v2 research path ──
+                if RESEARCH_ARCHITECTURE == "unified":
+                    try:
+                        v2_response = await self._unified_research_v2(
+                            user_text=text,
+                            context=context,
+                            my_gen=my_gen,
+                            filler_duration=filler_duration,
+                            filler_relay_start=filler_relay_start,
+                        )
+                        if v2_response is not None:
+                            all_sentences, interrupted = v2_response
+                            used_unified = True
+                            research_ms = (_time.time() - t_research) * 1000
+                            print(f"[{ts()}] {self.tag} 🔬 Unified-v2 research: "
+                                  f"{research_ms:.0f}ms")
+                    except __import__("asyncio").CancelledError:
+                        raise
+                    except Exception as e:
+                        print(f"[{ts()}] {self.tag} ⚠️  Unified-v2 failed, "
+                              f"falling back: {e}")
+
+                # ── Tier 2: existing USE_UNIFIED_RESEARCH path (Feature 4) ──
+                if not used_unified and USE_UNIFIED_RESEARCH:
                     try:
                         unified_response = await self._unified_research_flow(
                             user_text=text,
@@ -3785,13 +5737,17 @@ class BotSession:
 
             # ── [PM] — use speculative LLM (already running!) ──
             else:
-                # Cancel dynamic filler task (not used in PM path)
+                # Cancel pre-fired dynamic filler task (not used in PM path).
+                # This costs ~1 wasted Groq call per PM turn, accepted as
+                # trade-off for contextual fillers on RESEARCH turns.
                 if filler_task is not None and not filler_task.done():
                     filler_task.cancel()
                     try:
                         await filler_task
                     except (asyncio.CancelledError, Exception):
                         pass
+                    print(f"[{ts()}] {self.tag} 🚫 Discarded pre-fired filler "
+                          f"(PM route — not needed)")
                 # LLM has been running since before router finished
                 # Sentences may already be in the queue
 
