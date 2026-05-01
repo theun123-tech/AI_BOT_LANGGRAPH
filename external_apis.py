@@ -27,9 +27,11 @@ Post-meeting:   EXTRACTION_PROMPT (Azure GPT-4o mini) extracts action items
 
 import os
 import json
+import time 
 import httpx
+import hashlib
 
-
+from typing import Optional
 # ── Prompt for Jira read responses (Groq, during meeting) ────────────────────
 
 JIRA_RESPONSE_PROMPT = """You are Sam, a PM on a live voice call. You just looked up Jira ticket info.
@@ -199,7 +201,12 @@ class AzureExtractor:
 
     def __init__(self):
         self.endpoint   = os.environ.get("AZURE_ENDPOINT", "").strip().rstrip("/")
-        self.api_key    = os.environ.get("AZURE_API_KEY", "").strip()
+        # Stage R: shared key rotator. Reads AZURE_API_KEYS (comma-separated,
+        # any count) and AZURE_API_KEY (singular, backward compat). With a
+        # single key configured, rotation is a no-op; future-ready for more.
+        from key_rotator import load_keys as _load_keys
+        self._azure_keys = _load_keys("AZURE")
+        self.api_key    = self._azure_keys[0] if self._azure_keys else ""
         self.deployment = os.environ.get("AZURE_DEPLOYMENT", "gpt-4o-mini").strip()
         self.api_version = os.environ.get("AZURE_API_VERSION", "2024-02-15-preview").strip()
 
@@ -210,7 +217,8 @@ class AzureExtractor:
 
         self.enabled = True
         self._client = httpx.AsyncClient(timeout=60)
-        print(f"[Azure] ✅ Configured: {self.endpoint} (deployment: {self.deployment})")
+        print(f"[Azure] ✅ Configured: {self.endpoint} (deployment: {self.deployment}, "
+              f"{len(self._azure_keys)} key(s))")
 
     async def extract_action_items(self, transcript: str, date_str: str = "",
                                     pending_intents: list | None = None) -> list[dict]:
@@ -513,11 +521,21 @@ class JiraTransitionError(Exception):
 
 
 class JiraClient:
-    def __init__(self):
-        self.base_url = os.environ.get("JIRA_BASE_URL", "").strip().rstrip("/")
-        self.email    = os.environ.get("JIRA_EMAIL", "").strip()
-        self.token    = os.environ.get("JIRA_API_TOKEN", "").strip()
-        self.project  = os.environ.get("JIRA_DEFAULT_PROJECT", "PROJ").strip()
+    def __init__(self, base_url: str = None, email: str = None,
+                 token: str = None, project: str = None):
+        # Override params (from UI test/load forms) take precedence over env
+        # vars. Empty strings count as "not provided" so the UI sending blanks
+        # falls through to env defaults rather than silently disabling Jira.
+        def _pick(override, env_key, default=""):
+            v = (override or "").strip() if override else ""
+            if v:
+                return v
+            return os.environ.get(env_key, default).strip()
+
+        self.base_url = _pick(base_url, "JIRA_BASE_URL").rstrip("/")
+        self.email    = _pick(email,    "JIRA_EMAIL")
+        self.token    = _pick(token,    "JIRA_API_TOKEN")
+        self.project  = _pick(project,  "JIRA_DEFAULT_PROJECT", "PROJ")
 
         if not all([self.base_url, self.email, self.token]):
             print("[Jira] ⚠️  Missing JIRA_BASE_URL, JIRA_EMAIL, or JIRA_API_TOKEN — Jira disabled")
@@ -882,10 +900,19 @@ class JiraClient:
     async def create_ticket(self, summary: str, issue_type: str = "Task",
                            priority: str = "Medium", description: str = "",
                            labels: list[str] = None, assignee_id: str = None) -> dict:
+        # Resolve the requested issue_type against what THIS project actually
+        # supports. Different Jira projects have different issue type schemes
+        # — e.g. one project has "Bug", another has "Defect", a third has
+        # neither and only allows "Task". This call picks the best match.
+        actual_type = await self._resolve_issue_type(issue_type)
+        if actual_type != issue_type:
+            print(f"[Jira] 🔄 Issue type '{issue_type}' not in project {self.project}, "
+                  f"using '{actual_type}' instead")
+
         fields = {
             "project": {"key": self.project},
             "summary": summary,
-            "issuetype": {"name": issue_type},
+            "issuetype": {"name": actual_type},
         }
         if description:
             fields["description"] = {
@@ -903,6 +930,78 @@ class JiraClient:
         ticket_key = data.get("key", "unknown")
         print(f"[Jira] ✅ Created: {ticket_key} — {summary}")
         return {"key": ticket_key, "id": data.get("id"), "summary": summary}
+
+    async def _get_project_issue_types(self) -> list[str]:
+        """Fetch the issue types available in THIS project. Cached per JiraClient
+        instance — not per call. If the user switches projects in Settings, a
+        new JiraClient gets created so the cache resets automatically.
+
+        Returns lowercase names for case-insensitive matching. Empty list on
+        failure (caller will fall back to ['Task']).
+        """
+        if hasattr(self, '_project_issue_types_cache') and self._project_issue_types_cache:
+            return self._project_issue_types_cache
+
+        # /project/{key} returns the project metadata including issueTypes
+        try:
+            data = await self._api("GET", f"/project/{self.project}")
+            types = data.get("issueTypes", []) if isinstance(data, dict) else []
+            # Skip subtask types here — those go through _get_subtask_type_name
+            names = [it.get("name", "") for it in types
+                     if not it.get("subtask", False) and it.get("name")]
+            if names:
+                print(f"[Jira] 📋 Project {self.project} issue types: {names}")
+                self._project_issue_types_cache = names
+                return names
+        except Exception as e:
+            print(f"[Jira] ⚠️  Could not fetch issue types for {self.project}: {e}")
+
+        # Last-resort fallback so caller never gets empty
+        self._project_issue_types_cache = ["Task"]
+        return ["Task"]
+
+    async def _resolve_issue_type(self, requested: str) -> str:
+        """Pick the best available issue type in this project for what the
+        caller asked for. Three-tier match:
+
+          1. Exact case-insensitive match (Bug → Bug)
+          2. Synonym map (Bug → Defect, Story → User Story, etc.)
+          3. Generic fallback (Task → whatever Task-like type exists, else
+             the first non-subtask type the project has)
+        """
+        available = await self._get_project_issue_types()
+        if not available:
+            return requested  # nothing to match against — let Jira reject if bad
+
+        # Tier 1 — exact match (case-insensitive)
+        for a in available:
+            if a.lower() == requested.lower():
+                return a
+
+        # Tier 2 — common synonyms. Each key is what callers pass; values are
+        # alternate names that mean the same thing. First match wins.
+        synonyms = {
+            "bug":         ["defect", "incident", "problem"],
+            "story":       ["user story", "feature", "epic story"],
+            "task":        ["work item", "to-do", "todo"],
+            "epic":        ["initiative", "theme"],
+            "feature":     ["story", "user story", "enhancement"],
+            "improvement": ["enhancement", "feature"],
+        }
+        for synonym in synonyms.get(requested.lower(), []):
+            for a in available:
+                if a.lower() == synonym.lower():
+                    return a
+
+        # Tier 3 — last-resort fallbacks in order of safety
+        for fallback in ["Task", "Story", "Issue"]:
+            for a in available:
+                if a.lower() == fallback.lower():
+                    return a
+
+        # If we reach here, project has none of the standard names. Use
+        # whatever the project's first non-subtask type is.
+        return available[0]
 
     async def _get_subtask_type_name(self) -> str:
         """Discover the project's subtask issue type name (varies by configuration)."""
@@ -1133,44 +1232,317 @@ import httpx
 from typing import Optional
 
 
+class ExaSearch:
+    """Exa neural search — replaces Brave AI Mode for the research path.
+ 
+    Exa is search-only — it returns structured results (title, url, content
+    excerpts) rather than synthesized prose like Brave AI Mode. This means
+    we keep our Azure synthesis layer in control of the final answer, with
+    proper grounding to project context (Jira tickets, agenda, client profile).
+ 
+    Latency profile (from Jaipur to Exa US servers, our testing):
+      - instant tier: 1427ms avg (docs claim 250ms, real-world is 5x slower)
+      - fast tier:    1615ms avg
+      - auto tier:    1753ms avg ← USED HERE (best quality/latency tradeoff)
+ 
+    Quality findings from our testing:
+      - Modi "third term" CORRECT (Linkup got this WRONG)
+      - Authoritative sources (pmindia.gov.in, Wikipedia, Britannica)
+      - Fresh news coverage (April 2026 articles cited)
+      - No hallucination patterns seen with Brave (fake names, fake agenda)
+ 
+    Free tier: 1000 searches/month. After that, ~$10/month for 5000 searches.
+ 
+    DEBUG MODE: saves raw response JSON to exa_debug/<timestamp>_<hash>.json.
+    Set EXA_DEBUG=0 to disable.
+    """
+ 
+    # Exa REST API endpoint — single search call
+    _ENDPOINT = "https://api.exa.ai/search"
+ 
+    # Defaults — match the parameters that worked best in our testing
+    _DEFAULT_NUM_RESULTS = 8
+    _DEFAULT_TYPE = "instant"  # "auto" picks neural vs keyword per-query
+ 
+    def __init__(self):
+        # Stage R: shared key rotator. Reads EXA_API_KEYS (comma-separated,
+        # any count) and EXA_API_KEY (singular, backward compat).
+        from key_rotator import load_keys as _load_keys
+        self._exa_keys = _load_keys("EXA")
+        # api_key remains for any legacy code paths that still reference it
+        # directly; it's the first key in the rotation pool.
+        self.api_key = self._exa_keys[0] if self._exa_keys else ""
+ 
+        if not self._exa_keys:
+            print("[ExaSearch] ⚠️  No EXA_API_KEY(S) set — Exa search disabled "
+                  "(will fall back to Brave)")
+            self.enabled = False
+        else:
+            self.enabled = True
+            print(f"[ExaSearch] ✅ Configured ({len(self._exa_keys)} key(s), "
+                  f"first: {self.api_key[:8]}...)")
+ 
+        # 5s budget cap — Exa typically returns in ~1.5s; if it's slower than
+        # 5s we'd rather fall back to Brave than blow the filler window.
+        self._client = httpx.AsyncClient(timeout=5.0)
+ 
+        # Circuit breaker — if Exa fails N times in a row, websocket_server can
+        # check this counter and decide to skip Exa for the remainder of session.
+        self.consecutive_failures = 0
+ 
+    async def search(
+        self,
+        query: str,
+        num_results: int = None,
+        search_type: str = None,
+    ) -> Optional[list[dict]]:
+        """Search Exa and return cleaned results ready for Azure synthesis.
+ 
+        Args:
+          query: clean search query (e.g. "OTP best practices Salesforce 2026").
+                 NOT a long persona prompt — Exa expects a search query, not
+                 a chat prompt. Caller should pass plan["web_search_query"]
+                 from the unified planner, or fall back to user_text.
+          num_results: 1-25 (Exa max), default 8.
+          search_type: "auto" / "neural" / "keyword" / "fast", default "auto".
+ 
+        Returns:
+          list[dict] with keys: title, url, content, published_date, score
+          OR None on any failure (caller falls back to Brave).
+ 
+        Logging:
+          Logs timing per phase (HTTP round-trip, parse, total) like Brave.
+          Saves raw JSON to exa_debug/ folder when EXA_DEBUG != "0".
+        """
+        if not self.enabled:
+            return None
+ 
+        if not query or not query.strip():
+            print("[ExaSearch] ⚠️  Empty query — skipping")
+            return None
+ 
+        query = query.strip()
+        num_results = num_results or self._DEFAULT_NUM_RESULTS
+        search_type = search_type or self._DEFAULT_TYPE
+ 
+        t_start = time.time()
+        debug_enabled = os.environ.get("EXA_DEBUG", "1") != "0"
+        query_hash = hashlib.md5(
+            query.encode("utf-8", errors="ignore")
+        ).hexdigest()[:8]
+ 
+        print(f"[ExaSearch] ╔══════════════════ EXA SEARCH ({search_type}) ══════════════════")
+        print(f"[ExaSearch] ║ Query:        \"{query[:80]}\"" + ("..." if len(query) > 80 else ""))
+        print(f"[ExaSearch] ║ Query hash:   {query_hash}")
+        print(f"[ExaSearch] ║ NumResults:   {num_results}")
+        print(f"[ExaSearch] ║ Type:         {search_type}")
+ 
+        # Build request body. Highlights mode keeps the response token-efficient
+        # while still giving Azure enough context to synthesize a real answer.
+        # numSentences=5 + highlightsPerUrl=2 → ~10 sentences × 8 results
+        # ≈ 4-6 KB of relevant text per query — plenty for synthesis, low cost.
+        request_body = {
+            "query": query,
+            "type": search_type,
+            "numResults": num_results,
+            "contents": {
+                "highlights": {
+                    "maxCharacters": 1200,
+                    "query": query,
+                },
+                # Also request a short text excerpt as backup if highlights
+                # come back empty for a result. maxCharacters caps token use.
+                "text": {
+                    "maxCharacters": 1500,
+                    "includeHtmlTags": False,
+                },
+            },
+        }
+ 
+        debug_file_path = None
+ 
+        # Stage R: pick a fresh key per request (rotates across all configured
+        # Exa keys with cooldown-aware skipping). Falls back to first key if
+        # rotator returns nothing.
+        try:
+            from key_rotator import key_for_request as _key_for_request
+            _exa_key = _key_for_request("EXA") or self.api_key
+        except Exception:
+            _exa_key = self.api_key
+
+        try:
+            t_http = time.time()
+            resp = await self._client.post(
+                self._ENDPOINT,
+                headers={
+                    "x-api-key": _exa_key,
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                json=request_body,
+            )
+            http_ms = (time.time() - t_http) * 1000
+            content_len = len(resp.content) if resp.content else 0
+            print(f"[ExaSearch] ║ HTTP round-trip: {http_ms:.0f}ms  "
+                  f"(status={resp.status_code}, {content_len} bytes)")
+ 
+            if resp.status_code == 401:
+                # Stage R: mark this key bad so rotator skips it
+                try:
+                    from key_rotator import mark_key_failed as _mark_key_failed
+                    _mark_key_failed("EXA", _exa_key, cooldown_seconds=300.0)
+                except Exception:
+                    pass
+                print(f"[ExaSearch] ║ ❌ 401 Unauthorized — check EXA_API_KEY")
+                print(f"[ExaSearch] ╚══════════════════════════════════════════════════════════════")
+                self.consecutive_failures += 1
+                return None
+ 
+            if resp.status_code == 429:
+                print(f"[ExaSearch] ║ ❌ 429 Rate-limited — likely free-tier quota exceeded")
+                print(f"[ExaSearch] ║    Falling back to Brave for the rest of session")
+                print(f"[ExaSearch] ╚══════════════════════════════════════════════════════════════")
+                self.consecutive_failures += 1
+                return None
+ 
+            if resp.status_code >= 400:
+                err_text = resp.text[:300] if resp.text else "(no body)"
+                print(f"[ExaSearch] ║ ❌ HTTP {resp.status_code}: {err_text}")
+                print(f"[ExaSearch] ╚══════════════════════════════════════════════════════════════")
+                self.consecutive_failures += 1
+                return None
+ 
+            t_parse = time.time()
+            data = resp.json()
+            print(f"[ExaSearch] ║ JSON parse: {(time.time()-t_parse)*1000:.0f}ms")
+ 
+            # ── DEBUG: save raw response to disk ──
+            if debug_enabled:
+                try:
+                    timestamp = time.strftime("%Y%m%d-%H%M%S")
+                    debug_dir = "exa_debug"
+                    os.makedirs(debug_dir, exist_ok=True)
+                    debug_file_path = os.path.join(
+                        debug_dir,
+                        f"exa_{timestamp}_{query_hash}.json",
+                    )
+                    with open(debug_file_path, "w", encoding="utf-8") as f:
+                        json.dump({
+                            "query": query,
+                            "query_hash": query_hash,
+                            "type": search_type,
+                            "num_results_requested": num_results,
+                            "http_status": resp.status_code,
+                            "http_round_trip_ms": int(http_ms),
+                            "request_body": request_body,
+                            "response": data,
+                        }, f, indent=2, ensure_ascii=False)
+                    print(f"[ExaSearch] ║ 💾 Saved JSON: {debug_file_path}")
+                except Exception as e:
+                    print(f"[ExaSearch] ║ ⚠️  Debug save failed: {e}")
+ 
+            # Parse Exa's response into a clean structure
+            results = data.get("results", []) or []
+            if not isinstance(results, list) or not results:
+                print(f"[ExaSearch] ║ ⚠️  No results in response")
+                print(f"[ExaSearch] ╚══════════════════════════════════════════════════════════════")
+                self.consecutive_failures += 1
+                return None
+ 
+            cleaned = []
+            for r in results:
+                if not isinstance(r, dict):
+                    continue
+                # Prefer highlights (relevant excerpts); fall back to text
+                highlights = r.get("highlights") or []
+                if isinstance(highlights, list) and highlights:
+                    content = " ... ".join(
+                        h.strip() for h in highlights if h and h.strip()
+                    )
+                else:
+                    content = (r.get("text") or "").strip()
+ 
+                if not content:
+                    continue  # skip results with no usable content
+ 
+                # Trim runaway content (some pages have very long highlights)
+                if len(content) > 2000:
+                    content = content[:1997] + "..."
+ 
+                cleaned.append({
+                    "title": (r.get("title") or "").strip(),
+                    "url": (r.get("url") or "").strip(),
+                    "content": content,
+                    "published_date": (r.get("publishedDate") or "").strip()[:10],
+                    "score": float(r.get("score") or 0.0),
+                })
+ 
+            if not cleaned:
+                print(f"[ExaSearch] ║ ⚠️  Got {len(results)} results but none had usable content")
+                print(f"[ExaSearch] ╚══════════════════════════════════════════════════════════════")
+                self.consecutive_failures += 1
+                return None
+ 
+            total_ms = (time.time() - t_start) * 1000
+            print(f"[ExaSearch] ║ ✅ {len(cleaned)} results "
+                  f"({sum(len(r['content']) for r in cleaned)} chars total)")
+            print(f"[ExaSearch] ║ Top sources: {', '.join(r['url'].split('/')[2] if '/' in r['url'] else r['url'] for r in cleaned[:3])}")
+            print(f"[ExaSearch] ║ TOTAL: {total_ms:.0f}ms")
+            if debug_file_path:
+                print(f"[ExaSearch] ║ 📂 Inspect JSON at: {debug_file_path}")
+            print(f"[ExaSearch] ╚══════════════════════════════════════════════════════════════")
+ 
+            # Reset failure counter on success
+            self.consecutive_failures = 0
+            return cleaned
+ 
+        except httpx.TimeoutException:
+            total_ms = (time.time() - t_start) * 1000
+            print(f"[ExaSearch] ║ ❌ TIMEOUT after {total_ms:.0f}ms (5s cap)")
+            print(f"[ExaSearch] ╚══════════════════════════════════════════════════════════════")
+            self.consecutive_failures += 1
+            return None
+        except Exception as e:
+            total_ms = (time.time() - t_start) * 1000
+            print(f"[ExaSearch] ║ ❌ {type(e).__name__} after {total_ms:.0f}ms: {e}")
+            print(f"[ExaSearch] ╚══════════════════════════════════════════════════════════════")
+            self.consecutive_failures += 1
+            return None
+ 
+    async def close(self):
+        """Close the underlying HTTP client. Safe to call multiple times."""
+        try:
+            await self._client.aclose()
+        except Exception:
+            pass
+
+
 class WebSearch:
     def __init__(self):
-        self._keys = []
-        # Load SERPAPI_KEY_1 through SERPAPI_KEY_17 (only those set)
-        for i in range(1, 18):
-            k = os.environ.get(f"SERPAPI_KEY_{i}", "").strip().strip('"\'')
-            if k:
-                self._keys.append(k)
-        # Backwards compatibility: also accept SERPAPI_KEY (unnumbered)
-        k_plain = os.environ.get("SERPAPI_KEY", "").strip().strip('"\'')
-        if k_plain and k_plain not in self._keys:
-            self._keys.append(k_plain)
+        # Stage R: shared key rotator. Reads SERPAPI_KEYS (comma-separated,
+        # any count), SERPAPI_KEY (singular), and legacy SERPAPI_KEY_1..N.
+        from key_rotator import load_keys as _load_keys
+        self._keys = _load_keys("SERPAPI")
         if not self._keys:
             print("[WebSearch] ⚠️  No SERPAPI keys — web search disabled")
         else:
             first = self._keys[0]
             print(f"[WebSearch] {len(self._keys)} key(s) loaded (key1: {first[:8]}...)")
         self._key_index = 0
-        # ── Persistent connection config ────────────────────────────────
-        # Default httpx keepalive_expiry is 5s — too short for voice
-        # conversations where web-search gaps are often >5s. We push to
-        # 5 minutes so the TCP+TLS handshake (~300ms) is paid once per
-        # meeting, not once per query.
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(
-                connect=5.0,      # TCP + TLS handshake
-                read=8.0,         # total wait for SerpAPI to respond (was 20s)
-                write=5.0,
-                pool=5.0,
-            ),
-            limits=httpx.Limits(
-                max_keepalive_connections=4,
-                max_connections=8,
-                keepalive_expiry=300.0,   # 5 min — survives long meeting pauses
-            ),
-        )
+        self._client = httpx.AsyncClient(timeout=20.0)
 
     def _next_key(self) -> str:
+        # Stage R: delegate to shared rotator for global round-robin and
+        # cooldown-aware skipping. Falls back to local index if rotator
+        # has no keys for this service (shouldn't happen — we just loaded).
+        try:
+            from key_rotator import key_for_request as _key_for_request
+            key = _key_for_request("SERPAPI")
+            if key:
+                return key
+        except Exception:
+            pass
+        # Defensive fallback to legacy local rotation
         key = self._keys[self._key_index % len(self._keys)]
         self._key_index += 1
         return key
@@ -1188,134 +1560,279 @@ class WebSearch:
         return " ".join(words[:max_words])
 
     async def search(self, query: str) -> Optional[str]:
+        """Search via SerpAPI Google AI Mode with geo grounding.
+
+        SWITCHED FROM engine='google' TO engine='google_ai_mode' so Sam gets
+        Google's pre-synthesized AI answer for in-meeting research questions.
+        Adds geo grounding (gl/hl/location, India defaults) so AI Mode treats
+        queries as locally-rooted and is more likely to synthesize answers
+        rather than just returning citations.
+
+        Response handling (in priority order):
+          1. reconstructed_markdown — full prose synthesis (best case)
+          2. text_blocks — paragraph snippets (assemble into prose)
+          3. references-only fallback — retry once if first attempt was empty;
+             after retry, stitch top citation snippets if still no synthesis
+
+        Configurable via env: SERPAPI_GL, SERPAPI_HL, SERPAPI_LOCATION.
+
+        Returns voice-ready text (up to 800 chars) or None on hard failure.
+        """
         if not self._keys:
+            return None
+
+        import time as _t
+        import os as _os
+        t_start = _t.time()
+
+        trimmed = self._trim_query(query)
+
+        # Geo grounding params — same defaults as Know About Them flow.
+        # Override per-environment with env vars if you serve different regions.
+        gl_param = (_os.environ.get("SERPAPI_GL") or "in").strip()
+        hl_param = (_os.environ.get("SERPAPI_HL") or "en").strip()
+        location_param = (_os.environ.get("SERPAPI_LOCATION") or "India").strip()
+
+        print(f"[WebSearch] SerpAPI AI Mode query: \"{trimmed}\"")
+        print(f"[WebSearch] Geo: gl={gl_param}, hl={hl_param}, location={location_param}")
+        print(f"[WebSearch] ⏱ [STEP 1] prep done: {(_t.time()-t_start)*1000:.0f}ms")
+
+        # Try up to 2 attempts because AI Mode is non-deterministic — same query
+        # can return synthesis or just citations depending on Google session.
+        last_references: list = []
+        last_data: dict = {}
+
+        for attempt_num in range(1, 3):  # 1, 2 (max 2 attempts = 1 retry)
+            api_key = self._next_key()
+            print(f"[WebSearch] Attempt {attempt_num} (key #{self._key_index})")
+
+            try:
+                # STEP 2: HTTP round-trip
+                t_http = _t.time()
+                resp = await self._client.get(
+                    "https://serpapi.com/search.json",
+                    params={
+                        "engine": "google_ai_mode",
+                        "q": trimmed,
+                        "api_key": api_key,
+                        "gl": gl_param,
+                        "hl": hl_param,
+                        "location": location_param,
+                    },
+                )
+                t_http_done = _t.time()
+                content_len = len(resp.content) if resp.content else 0
+                print(f"[WebSearch] ⏱ [STEP 2] HTTP round-trip: "
+                      f"{(t_http_done-t_http)*1000:.0f}ms "
+                      f"(status={resp.status_code}, {content_len} bytes)")
+
+                if resp.status_code != 200:
+                    print(f"[WebSearch] Attempt {attempt_num}: HTTP "
+                          f"{resp.status_code}: {resp.text[:200]}")
+                    continue  # retry
+
+                # STEP 3: parse JSON
+                t_parse = _t.time()
+                data = resp.json()
+                last_data = data
+                print(f"[WebSearch] ⏱ [STEP 3] JSON parse: "
+                      f"{(_t.time()-t_parse)*1000:.0f}ms")
+
+                # Diagnostic: which top-level fields came back?
+                top_keys = [
+                    k for k in data.keys()
+                    if k not in ("search_metadata", "search_parameters")
+                ]
+                print(f"[WebSearch] Attempt {attempt_num}: fields={top_keys}")
+
+                # STEP 4: extract synthesized answer in priority order
+                t_extract = _t.time()
+
+                # 1. reconstructed_markdown — preferred (full prose answer)
+                recon = (data.get("reconstructed_markdown", "") or "").strip()
+                if recon:
+                    cleaned = self._strip_markdown_for_voice(recon)[:800]
+                    print(f"[WebSearch] ⏱ [STEP 4] field extract "
+                          f"(reconstructed_markdown): {(_t.time()-t_extract)*1000:.0f}ms")
+                    print(f"[WebSearch] ✅ AI Mode synthesized "
+                          f"({len(cleaned)} chars via markdown)")
+                    print(f"[WebSearch] ⏱ [TOTAL] search(): "
+                          f"{(_t.time()-t_start)*1000:.0f}ms (attempt {attempt_num})")
+                    return cleaned
+
+                # 2. text_blocks — assemble paragraph snippets
+                text_blocks = data.get("text_blocks", []) or []
+                if text_blocks:
+                    parts = []
+                    for b in text_blocks:
+                        if not isinstance(b, dict):
+                            continue
+                        snippet = (b.get("snippet") or b.get("text") or "").strip()
+                        if snippet:
+                            parts.append(snippet)
+                        for it in (b.get("list") or []):
+                            if isinstance(it, dict):
+                                it_snip = (it.get("snippet") or it.get("text") or "").strip()
+                                if it_snip:
+                                    parts.append(it_snip)
+                    if parts:
+                        combined = self._strip_markdown_for_voice(" ".join(parts))[:800]
+                        print(f"[WebSearch] ⏱ [STEP 4] field extract "
+                              f"(text_blocks): {(_t.time()-t_extract)*1000:.0f}ms")
+                        print(f"[WebSearch] ✅ AI Mode synthesized "
+                              f"({len(combined)} chars via text_blocks)")
+                        print(f"[WebSearch] ⏱ [TOTAL] search(): "
+                              f"{(_t.time()-t_start)*1000:.0f}ms (attempt {attempt_num})")
+                        return combined
+
+                # 3. References-only response — capture for fallback after retries
+                last_references = data.get("references", []) or []
+                print(f"[WebSearch] Attempt {attempt_num}: only references "
+                      f"({len(last_references)} citations) — will retry if attempts remain")
+
+            except httpx.TimeoutException:
+                print(f"[WebSearch] Attempt {attempt_num}: TIMEOUT on \"{trimmed}\"")
+                continue
+            except Exception as e:
+                print(f"[WebSearch] Attempt {attempt_num}: Error {type(e).__name__}: {e}")
+                continue
+
+        # All attempts exhausted without synthesis. Fall back to stitching the
+        # citation snippets from the last response. This is a downgrade —
+        # raw citation excerpts, not synthesized prose — but it's grounded in
+        # real Google sources, which is better than returning nothing.
+        if last_references:
+            snippet_parts = []
+            for r in last_references[:5]:  # cap at top 5 to keep latency low
+                if not isinstance(r, dict):
+                    continue
+                sn = (r.get("snippet") or "").strip()
+                if sn:
+                    sn = re.sub(r"\s+", " ", sn).strip()
+                    snippet_parts.append(sn)
+
+            # Dedupe near-identical leading text
+            seen = set()
+            unique = []
+            for s in snippet_parts:
+                key = s[:60].lower()
+                if key not in seen:
+                    seen.add(key)
+                    unique.append(s)
+
+            if unique:
+                combined = " ".join(unique)[:800]
+                print(f"[WebSearch] ⚠️  Fallback: stitched {len(unique)} citation "
+                      f"snippets ({len(combined)} chars) — no synthesis after retries")
+                print(f"[WebSearch] ⏱ [TOTAL] search(): "
+                      f"{(_t.time()-t_start)*1000:.0f}ms (references-fallback)")
+                return combined
+
+        # Truly nothing usable — return None so caller can fall back to Azure
+        print(f"[WebSearch] ❌ No usable content after all attempts")
+        print(f"[WebSearch] ⏱ [TOTAL] search() — empty: "
+              f"{(_t.time()-t_start)*1000:.0f}ms")
+        return None
+
+    @staticmethod
+    def _strip_markdown_for_voice(text: str) -> str:
+        """Strip markdown formatting from AI Mode output so TTS sounds natural.
+
+        AI Mode's reconstructed_markdown often contains [text](url) inline
+        links, ### headers, * bullets, and \\(escaped\\) chars. Voice users
+        don't want to hear "open square bracket text close square bracket
+        open paren U R L" — strip it all to plain prose.
+
+        Lighter-weight version of server.py's _clean_profile_markdown
+        (which is more aggressive). For in-meeting use we just want clean
+        readable prose with no markdown noise.
+        """
+        if not text:
+            return ""
+        s = text
+
+        # Drop trailing References/Sources/Citations blocks
+        s = re.sub(
+            r"\s*#{1,6}\s*(References|Sources|Citations)\b.*$",
+            "",
+            s,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        # Convert inline markdown links [text](url) → "text"
+        s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)
+
+        # Drop bare citation markers [0], [12], [^3]
+        s = re.sub(r"\[\^?\d+\]", "", s)
+
+        # Strip headers, bold, italic markers
+        s = re.sub(r"^\s*#{1,6}\s+", "", s, flags=re.MULTILINE)
+        s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)
+        s = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", s)
+
+        # Strip mid-line headers and bullets (single-line markdown)
+        s = re.sub(r"\s*#{1,6}\s+", " ", s)
+        s = re.sub(r"(?:^|\s)[-*•]\s+", " ", s)
+
+        # Unescape common backslash-escaped punctuation
+        s = s.replace("\\(", "(").replace("\\)", ")")
+        s = s.replace("\\-", "-").replace("\\+", "+")
+        s = s.replace("\\&", "&").replace("\\.", ".")
+        s = s.replace("\\,", ",").replace("\\:", ":")
+
+        # Collapse whitespace
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+    async def search_raw(self, query: str, max_length: int = 2000,
+                          use_references_fallback: bool = False) -> Optional[str]:
+        """Door #1 — Search via SerpAPI **Brave AI Mode** for rich persona-based queries.
+
+        SWITCHED FROM google_ai_mode TO brave_ai_mode after testing showed:
+          - Google AI Mode degrades long persona prompts (returns empty/off-topic
+            fragments because Google treats input as a search query, not a chat prompt)
+          - Brave AI Mode honors long persona prompts as actual conversational input
+            (uses the project context, returns natural prose, says "I don't know"
+            honestly when context is insufficient instead of hallucinating)
+
+        Engine differences vs old google_ai_mode:
+          - Param: gl → country, hl → language (location stays the same)
+          - Response: 'markdown' (NOT 'reconstructed_markdown')
+          - Web results: 'web_results' (NOT 'organic_results')
+          - References: cleaner structure (just title, link, source_icon)
+          - Bonus: 'subsequent_request_token' for multi-turn (currently unused)
+
+        Response structure for brave_ai_mode:
+          - markdown: full prose answer with inline citations [N] (top-level)
+          - text_blocks: structured blocks (heading, paragraph, list) with
+                         segments → snippet + citations (per-segment grounding)
+          - references: list of {title, link, source_icon, index}
+          - web_results: organic-style search results (used for fallback)
+          - subsequent_request_token: pass on next call to maintain context
+
+        Returns the answer text (up to 1500 chars) or None on failure. When None
+        is returned, the caller (websocket_server.py legacy path) falls back to
+        Google AI Mode + Azure synthesis as a safety net.
+
+        use_references_fallback (default False):
+          When True, if neither markdown nor text_blocks come back, stitch the
+          web_results snippets into prose as a last resort. Useful for niche
+          queries where Brave returns only citations without synthesis.
+
+        DEBUG MODE: logs full query + response + saves raw JSON to disk under
+        serpapi_debug/brave_aimode_<timestamp>_<hash>.json — share this file
+        when sending logs back so the actual SerpAPI response can be inspected
+        directly. Set SERPAPI_DEBUG=0 in env to disable JSON dumps.
+        """
+        if not self._keys:
+            print(f"[WebSearch] ❌ search_raw: no SerpAPI keys configured")
             return None
 
         import time as _t
         t_start = _t.time()
 
-        trimmed = self._trim_query(query)
-        api_key = self._next_key()
-        print(f"[WebSearch] SerpAPI query: \"{trimmed}\" (key #{self._key_index})")
-        print(f"[WebSearch] ⏱ [STEP 1] prep done: {(_t.time()-t_start)*1000:.0f}ms")
-
-        try:
-            # STEP 2: HTTP request to SerpAPI (DNS + connect + TLS + server compute + download)
-            # ── LATENCY OPTIMIZATIONS ─────────────────────────────────
-            # 1. engine=google_light — faster variant, ~1.4s avg vs ~2.3s
-            #    for regular google. Trade-off: may skip answer_box /
-            #    knowledge_graph / ai_overview — falls through to
-            #    organic_results which Light API still returns.
-            # 2. json_restrictor — limits response to fields we actually
-            #    use, reducing payload from ~38KB to ~2-3KB. Saves
-            #    network transfer + JSON parse time.
-            t_http = _t.time()
-            resp = await self._client.get(
-                "https://serpapi.com/search.json",
-                params={
-                    "engine": "google_light",  # was: "google" — Light API is ~60% faster
-                    "q": trimmed,
-                    "api_key": api_key,
-                    "num": 3,
-                    # Limit JSON response to only fields we extract below.
-                    # Includes answer_box/knowledge_graph/ai_overview in case
-                    # Light API returns them; always includes organic_results.
-                    "json_restrictor": "answer_box,knowledge_graph,ai_overview,organic_results",
-                },
-            )
-            t_http_done = _t.time()
-            content_len = len(resp.content) if resp.content else 0
-            print(f"[WebSearch] ⏱ [STEP 2] HTTP round-trip: {(t_http_done-t_http)*1000:.0f}ms "
-                  f"(status={resp.status_code}, {content_len} bytes)")
-
-            if resp.status_code != 200:
-                print(f"[WebSearch] HTTP {resp.status_code}: {resp.text[:200]}")
-                return None
-
-            # STEP 3: JSON parsing
-            t_parse = _t.time()
-            data = resp.json()
-            print(f"[WebSearch] ⏱ [STEP 3] JSON parse: {(_t.time()-t_parse)*1000:.0f}ms")
-
-            # STEP 4: Extract best result field
-            t_extract = _t.time()
-
-            # 1. Answer box
-            ab = data.get("answer_box", {})
-            answer = ab.get("answer", "") or ab.get("snippet", "")
-            if answer:
-                print(f"[WebSearch] ⏱ [STEP 4] field extract (answer_box): {(_t.time()-t_extract)*1000:.0f}ms")
-                print(f"[WebSearch] Answer box ({len(answer)} chars)")
-                print(f"[WebSearch] ⏱ [TOTAL] search(): {(_t.time()-t_start)*1000:.0f}ms")
-                return answer[:800]
-
-            # 2. Knowledge graph
-            kg = data.get("knowledge_graph", {})
-            if kg.get("description"):
-                title = kg.get("title", "")
-                result = f"{title}: {kg['description']}" if title else kg["description"]
-                print(f"[WebSearch] ⏱ [STEP 4] field extract (knowledge_graph): {(_t.time()-t_extract)*1000:.0f}ms")
-                print(f"[WebSearch] Knowledge graph ({len(result)} chars)")
-                print(f"[WebSearch] ⏱ [TOTAL] search(): {(_t.time()-t_start)*1000:.0f}ms")
-                return result[:800]
-
-            # 3. AI overview
-            ai = data.get("ai_overview", {})
-            if ai:
-                parts = [b.get("snippet", "") for b in ai.get("text_blocks", []) if b.get("snippet")]
-                if parts:
-                    combined = " ".join(parts)[:800]
-                    print(f"[WebSearch] ⏱ [STEP 4] field extract (ai_overview): {(_t.time()-t_extract)*1000:.0f}ms")
-                    print(f"[WebSearch] AI overview ({len(combined)} chars)")
-                    print(f"[WebSearch] ⏱ [TOTAL] search(): {(_t.time()-t_start)*1000:.0f}ms")
-                    return combined
-
-            # 4. Organic results
-            organic = data.get("organic_results", [])
-            parts = [r.get("snippet", "") for r in organic[:3] if r.get("snippet")]
-            if parts:
-                combined = " ".join(parts)[:800]
-                print(f"[WebSearch] ⏱ [STEP 4] field extract (organic): {(_t.time()-t_extract)*1000:.0f}ms")
-                print(f"[WebSearch] Organic results ({len(combined)} chars)")
-                print(f"[WebSearch] ⏱ [TOTAL] search(): {(_t.time()-t_start)*1000:.0f}ms")
-                return combined
-
-            print(f"[WebSearch] ⏱ [STEP 4] field extract (none): {(_t.time()-t_extract)*1000:.0f}ms")
-            print(f"[WebSearch] ⏱ [TOTAL] search() — no results: {(_t.time()-t_start)*1000:.0f}ms")
-            return None
-
-        except httpx.TimeoutException:
-            print(f"[WebSearch] TIMEOUT: {trimmed}")
-            print(f"[WebSearch] ⏱ [TOTAL] search() — TIMEOUT after: {(_t.time()-t_start)*1000:.0f}ms")
-            return None
-        except Exception as e:
-            print(f"[WebSearch] Error: {type(e).__name__}: {e}")
-            print(f"[WebSearch] ⏱ [TOTAL] search() — ERROR after: {(_t.time()-t_start)*1000:.0f}ms")
-            return None
-
-    async def search_raw(self, query: str, max_length: int = 2000) -> Optional[str]:
-        """Search via SerpAPI Google AI Mode engine — for rich persona-based queries.
-
-        IMPORTANT: Uses engine='google_ai_mode' (NOT 'google'). These are
-        different SerpAPI products:
-          - engine='google' → regular Google Search (returns organic + AI Overview)
-          - engine='google_ai_mode' → Google AI Mode (returns AI-generated answer)
-
-        Response structure for google_ai_mode:
-          - text_blocks: list of structured blocks (paragraphs, lists)
-          - reconstructed_markdown: complete markdown answer (top-level field)
-          - references: citation links
-          - search_metadata.status: 'Success' or 'Error'
-
-        Returns the answer text (up to 1500 chars) or None on failure.
-
-        DEBUG MODE: logs full query + response + saves raw JSON to disk.
-        Set SERPAPI_DEBUG=0 in env to disable JSON dumps.
-        """
-        if not self._keys:
-            return None
-
-        # Cap length to avoid query limits
+        # Cap length to avoid query limits (Brave handles long queries better
+        # than Google but still has practical limits)
         if len(query) > max_length:
             print(f"[WebSearch] ⚠️  Query truncated: {len(query)} → {max_length} chars")
             query = query[:max_length]
@@ -1323,124 +1840,326 @@ class WebSearch:
         api_key = self._next_key()
         debug_enabled = os.environ.get("SERPAPI_DEBUG", "1") != "0"
 
-        # ── DEBUG: Log full query ──
-        print(f"[WebSearch] ═══════════════════════════════════════════════════════")
-        print(f"[WebSearch] Google AI Mode query: {len(query)} chars (key #{self._key_index})")
-        print(f"[WebSearch] ── Full query ──")
+        # ── DEBUG: Pre-call summary ──
+        # Hash the query so we can correlate calls across logs even when the
+        # full text is too long to read inline.
+        import hashlib as _hashlib
+        query_hash = _hashlib.md5(query.encode("utf-8", errors="ignore")).hexdigest()[:8]
+
+        # Brave uses different param names than Google:
+        #   Google → gl=in,           hl=en,             location=India
+        #   Brave  → country=in,      language=en,       location=India
+        # Env vars stay the same name (BRAVE_COUNTRY/BRAVE_LANGUAGE/BRAVE_LOCATION
+        # if you want to override Brave-specific; falls back to SERPAPI_GL/HL
+        # /LOCATION which were the Google-era names you may already have set).
+        brave_country = (
+            os.environ.get("BRAVE_COUNTRY")
+            or os.environ.get("SERPAPI_GL")
+            or "in"
+        ).strip()
+        brave_language = (
+            os.environ.get("BRAVE_LANGUAGE")
+            or os.environ.get("SERPAPI_HL")
+            or "en"
+        ).strip()
+        brave_location = (
+            os.environ.get("BRAVE_LOCATION")
+            or os.environ.get("SERPAPI_LOCATION")
+            or "India"
+        ).strip()
+
+        print(f"[WebSearch] ╔══════════════════ DOOR #1 (brave_ai_mode) ══════════════════")
+        print(f"[WebSearch] ║ Query length:  {len(query)} chars")
+        print(f"[WebSearch] ║ Query hash:    {query_hash}")
+        print(f"[WebSearch] ║ Key used:      #{self._key_index}")
+        print(f"[WebSearch] ║ Geo:           country={brave_country}, "
+              f"language={brave_language}, location={brave_location}")
+        print(f"[WebSearch] ║ Debug JSON:    {'ON' if debug_enabled else 'OFF'} "
+              f"(set SERPAPI_DEBUG=0 to disable)")
+        print(f"[WebSearch] ╠── Full query (verbatim) ─────────────────────────────────────")
         for line in query.split("\n"):
-            print(f"[WebSearch] │ {line}")
-        print(f"[WebSearch] ── End of query ──")
+            print(f"[WebSearch] ║ {line}")
+        print(f"[WebSearch] ╠── End of query ──────────────────────────────────────────────")
+
+        debug_file_path = None  # Set after save
 
         try:
+            t_http = _t.time()
             resp = await self._client.get(
                 "https://serpapi.com/search.json",
                 params={
-                    "engine": "google_ai_mode",  # Google AI Mode engine
+                    "engine": "brave_ai_mode",   # ← Brave AI Mode (not google_ai_mode)
                     "q": query,
                     "api_key": api_key,
-                    # Location/language params help AI Mode ground properly.
-                    # Without these, SerpAPI's US servers can hit a variant of
-                    # AI Mode that skips grounding and just makes things up.
-                    # "in" = India (matches AnavClouds' web presence).
-                    "gl": os.environ.get("SERPAPI_GL", "in"),
-                    "hl": os.environ.get("SERPAPI_HL", "en"),
-                    "location": os.environ.get("SERPAPI_LOCATION", "India"),
+                    # Brave-specific param names (different from Google):
+                    "country": brave_country,    # Google's "gl" equivalent
+                    "language": brave_language,  # Google's "hl" equivalent
+                    "location": brave_location,  # Same as Google
                 },
             )
+            http_ms = (_t.time() - t_http) * 1000
+            content_len = len(resp.content) if resp.content else 0
+            print(f"[WebSearch] ║ HTTP round-trip: {http_ms:.0f}ms  "
+                  f"(status={resp.status_code}, {content_len} bytes)")
+
             if resp.status_code != 200:
-                print(f"[WebSearch] ❌ HTTP {resp.status_code}: {resp.text[:300]}")
-                print(f"[WebSearch] ═══════════════════════════════════════════════════════")
+                print(f"[WebSearch] ║ ❌ HTTP {resp.status_code}: {resp.text[:300]}")
+                print(f"[WebSearch] ╚══════════════════════════════════════════════════════════════")
                 return None
             data = resp.json()
 
-            # ── DEBUG: Save raw response ──
+            # ── DEBUG: Save raw response to disk for inspection ──
             if debug_enabled:
                 try:
                     import json as _json
-                    import time as _t
                     timestamp = _t.strftime("%Y%m%d-%H%M%S")
                     debug_dir = "serpapi_debug"
                     os.makedirs(debug_dir, exist_ok=True)
-                    debug_file = os.path.join(debug_dir, f"aimode_{timestamp}.json")
-                    with open(debug_file, "w", encoding="utf-8") as f:
+                    debug_file_path = os.path.join(
+                        debug_dir,
+                        f"brave_aimode_{timestamp}_{query_hash}.json",
+                    )
+                    with open(debug_file_path, "w", encoding="utf-8") as f:
                         _json.dump({
+                            "engine": "brave_ai_mode",
                             "query": query,
+                            "query_hash": query_hash,
+                            "query_length": len(query),
+                            "geo": {
+                                "country": brave_country,
+                                "language": brave_language,
+                                "location": brave_location,
+                            },
+                            "http_status": resp.status_code,
+                            "http_round_trip_ms": int(http_ms),
                             "response": data,
                         }, f, indent=2, ensure_ascii=False)
-                    print(f"[WebSearch] 💾 Debug saved: {debug_file}")
+                    print(f"[WebSearch] ║ 💾 Saved JSON: {debug_file_path}")
                 except Exception as _e:
-                    print(f"[WebSearch] ⚠️  Debug save failed: {_e}")
+                    print(f"[WebSearch] ║ ⚠️  Debug save failed: {_e}")
 
             # Check search status
             meta = data.get("search_metadata", {})
             status = meta.get("status", "?")
             if status != "Success":
                 err = data.get("error") or meta.get("error", "")
-                print(f"[WebSearch] ❌ AI Mode status: {status}, error: {err[:200]}")
-                print(f"[WebSearch] ═══════════════════════════════════════════════════════")
+                print(f"[WebSearch] ║ ❌ Brave AI Mode status: {status}, error: {err[:200]}")
+                print(f"[WebSearch] ╚══════════════════════════════════════════════════════════════")
                 return None
 
-            # ── DEBUG: Log which fields came back ──
-            top_keys = [k for k in data.keys() if k not in ("search_metadata", "search_parameters")]
-            print(f"[WebSearch] Response top-level fields: {top_keys}")
+            # ── DEBUG: Detailed response analysis ──
+            top_keys = sorted([
+                k for k in data.keys()
+                if k not in ("search_metadata", "search_parameters")
+            ])
+            print(f"[WebSearch] ║ Response top-level fields: {top_keys}")
+
+            # Brave-specific field names:
+            #   markdown (NOT reconstructed_markdown)
+            #   text_blocks (same as Google but with 'segments' nested)
+            #   references (same idea as Google)
+            #   web_results (Brave's organic-results equivalent)
+            markdown = data.get("markdown") or ""
+            blocks = data.get("text_blocks") or []
+            refs = data.get("references") or []
+            web_res = data.get("web_results") or []
+            sub_token = data.get("subsequent_request_token", "")
+
+            print(f"[WebSearch] ║   markdown:                "
+                  f"{'present (' + str(len(markdown)) + ' chars)' if markdown and markdown.strip() else 'EMPTY'}")
+            print(f"[WebSearch] ║   text_blocks:             "
+                  f"{len(blocks)} block(s)" if blocks else "║   text_blocks:             EMPTY")
+            print(f"[WebSearch] ║   references:              "
+                  f"{len(refs)} citation(s)" if isinstance(refs, list) and refs else "║   references:              EMPTY")
+            print(f"[WebSearch] ║   web_results:             "
+                  f"{len(web_res)} result(s)" if isinstance(web_res, list) and web_res else "║   web_results:             EMPTY")
+            print(f"[WebSearch] ║   subsequent_request_token: "
+                  f"{'present (' + str(len(sub_token)) + ' chars)' if sub_token else 'absent'}")
 
             # ── Grounding signal (informational only, not gating) ──
-            # Earlier versions rejected responses missing 'references' as ungrounded.
-            # Removed because it threw away factually correct answers (e.g. AnavClouds
-            # office location) where AI Mode just didn't surface references in the
-            # response format. We log the signal but trust the response either way.
-            references = data.get("references", [])
-            if isinstance(references, list) and len(references) > 0:
-                print(f"[WebSearch] ℹ️  Response has {len(references)} reference(s) (grounded)")
+            if isinstance(refs, list) and len(refs) > 0:
+                print(f"[WebSearch] ║ ℹ️  Grounded ({len(refs)} reference(s))")
+            elif isinstance(web_res, list) and len(web_res) > 0:
+                print(f"[WebSearch] ║ ℹ️  Web-grounded ({len(web_res)} web result(s))")
             else:
-                print(f"[WebSearch] ℹ️  Response has no references field (grounding status unknown)")
+                print(f"[WebSearch] ║ ℹ️  Grounding status unknown (no refs/web_results)")
 
-            # Strategy 1: reconstructed_markdown (preferred — complete answer)
-            reconstructed = data.get("reconstructed_markdown", "") or ""
-            if reconstructed and reconstructed.strip():
-                print(f"[WebSearch] ✅ reconstructed_markdown ({len(reconstructed)} chars)")
-                print(f"[WebSearch] ── Content (first 300 chars) ──")
-                print(f"[WebSearch] {reconstructed[:300]}")
-                print(f"[WebSearch] ═══════════════════════════════════════════════════════")
-                return reconstructed[:1500]
+            # Strategy 1: markdown (preferred — complete answer)
+            # Brave's 'markdown' often includes a "### References" section at the end.
+            # Strip that before returning so it doesn't get spoken aloud.
+            if markdown and markdown.strip():
+                cleaned_md = self._strip_brave_markdown_for_voice(markdown)
+                if cleaned_md:
+                    total_ms = (_t.time() - t_start) * 1000
+                    print(f"[WebSearch] ║ ✅ STRATEGY: markdown ({len(cleaned_md)} chars after cleanup)")
+                    print(f"[WebSearch] ╠── Content preview (first 300 chars) ─────────────────────────")
+                    preview = cleaned_md[:300].replace("\n", " ")
+                    print(f"[WebSearch] ║ {preview}")
+                    print(f"[WebSearch] ║ TOTAL search_raw: {total_ms:.0f}ms")
+                    if debug_file_path:
+                        print(f"[WebSearch] ║ 📂 Inspect JSON at: {debug_file_path}")
+                    print(f"[WebSearch] ╚══════════════════════════════════════════════════════════════")
+                    return cleaned_md[:1500]
+                else:
+                    print(f"[WebSearch] ║ ⚠️  markdown present but empty after cleanup")
 
-            # Strategy 2: text_blocks (fallback if reconstructed_markdown missing)
-            text_blocks = data.get("text_blocks", [])
-            if text_blocks:
-                print(f"[WebSearch] text_blocks count: {len(text_blocks)}")
+            # Strategy 2: text_blocks (fallback if markdown missing)
+            # Brave's text_blocks have a different shape than Google's:
+            #   {"type": "paragraph", "segments": [{"snippet": "...", "citations": [...]}]}
+            #   {"type": "list", "list": [{"snippet": "..."}]}
+            #   {"type": "heading", "snippet": "..."}
+            if blocks:
+                print(f"[WebSearch] ║ Falling back to text_blocks (no markdown)")
                 parts = []
-                for b in text_blocks:
-                    snippet = b.get("snippet") or b.get("text") or ""
+                for b in blocks:
+                    if not isinstance(b, dict):
+                        continue
+                    btype = b.get("type", "")
+                    # Direct snippet (heading, simple paragraph)
+                    snippet = (b.get("snippet") or b.get("text") or "").strip()
                     if snippet:
                         parts.append(snippet)
-                    for item in b.get("list", []):
-                        item_text = item.get("snippet") or item.get("text") or ""
-                        if item_text:
-                            parts.append(item_text)
+                    # Brave-specific: paragraph segments
+                    for seg in (b.get("segments") or []):
+                        if isinstance(seg, dict):
+                            sn = (seg.get("snippet") or seg.get("text") or "").strip()
+                            if sn:
+                                parts.append(sn)
+                    # List items
+                    for item in (b.get("list") or []):
+                        if isinstance(item, dict):
+                            item_text = (item.get("snippet") or item.get("text") or "").strip()
+                            if item_text:
+                                parts.append(item_text)
                 if parts:
                     combined = " ".join(parts)
-                    print(f"[WebSearch] ✅ text_blocks assembled ({len(combined)} chars)")
-                    print(f"[WebSearch] ── Content (first 300 chars) ──")
-                    print(f"[WebSearch] {combined[:300]}")
-                    print(f"[WebSearch] ═══════════════════════════════════════════════════════")
+                    total_ms = (_t.time() - t_start) * 1000
+                    print(f"[WebSearch] ║ ✅ STRATEGY: text_blocks assembled ({len(combined)} chars)")
+                    print(f"[WebSearch] ╠── Content preview (first 300 chars) ─────────────────────────")
+                    preview = combined[:300].replace("\n", " ")
+                    print(f"[WebSearch] ║ {preview}")
+                    print(f"[WebSearch] ║ TOTAL search_raw: {total_ms:.0f}ms")
+                    if debug_file_path:
+                        print(f"[WebSearch] ║ 📂 Inspect JSON at: {debug_file_path}")
+                    print(f"[WebSearch] ╚══════════════════════════════════════════════════════════════")
                     return combined[:1500]
                 else:
-                    print(f"[WebSearch] ⚠️  text_blocks exist but no usable text")
+                    print(f"[WebSearch] ║ ⚠️  text_blocks exist but no usable text")
 
-            # Neither strategy worked
-            print(f"[WebSearch] ❌ No usable content in AI Mode response → caller falls back to Azure")
-            print(f"[WebSearch] ═══════════════════════════════════════════════════════")
+            # Strategy 3 (opt-in): stitch web_results snippets when nothing else
+            # came back. This is a DOWNGRADE — web_results are raw search hits,
+            # not synthesized answers — so it's gated behind the
+            # use_references_fallback flag.
+            if use_references_fallback and isinstance(web_res, list) and web_res:
+                snippet_parts = []
+                for r in web_res:
+                    if not isinstance(r, dict):
+                        continue
+                    sn = (r.get("snippet") or "").strip()
+                    if sn:
+                        sn = re.sub(r"\s+", " ", sn).strip()
+                        snippet_parts.append(sn)
+                if snippet_parts:
+                    # Dedupe near-identical snippets
+                    seen_lower = set()
+                    unique = []
+                    for s in snippet_parts:
+                        key = s[:80].lower()
+                        if key not in seen_lower:
+                            seen_lower.add(key)
+                            unique.append(s)
+                    combined = " ".join(unique)
+                    total_ms = (_t.time() - t_start) * 1000
+                    print(f"[WebSearch] ║ ✅ STRATEGY: web_results-fallback "
+                          f"({len(unique)} unique snippets, {len(combined)} chars)")
+                    print(f"[WebSearch] ╠── Content preview (first 300 chars) ─────────────────────────")
+                    preview = combined[:300].replace("\n", " ")
+                    print(f"[WebSearch] ║ {preview}")
+                    print(f"[WebSearch] ║ TOTAL search_raw: {total_ms:.0f}ms")
+                    if debug_file_path:
+                        print(f"[WebSearch] ║ 📂 Inspect JSON at: {debug_file_path}")
+                    print(f"[WebSearch] ╚══════════════════════════════════════════════════════════════")
+                    return combined[:1500]
+                else:
+                    print(f"[WebSearch] ║ ⚠️  web_results exist but no usable snippets")
+
+            # Neither strategy worked — return None so caller falls back to Door #2
+            total_ms = (_t.time() - t_start) * 1000
+            print(f"[WebSearch] ║ ❌ STRATEGY: NONE (no usable content from Brave AI Mode)")
+            print(f"[WebSearch] ║    → caller will fall back to Door #2 (legacy Google + Azure)")
+            print(f"[WebSearch] ║ TOTAL search_raw: {total_ms:.0f}ms")
+            if debug_file_path:
+                print(f"[WebSearch] ║ 📂 Inspect the empty response at: {debug_file_path}")
+            print(f"[WebSearch] ╚══════════════════════════════════════════════════════════════")
             return None
 
         except httpx.TimeoutException:
-            print(f"[WebSearch] ❌ AI Mode TIMEOUT")
-            print(f"[WebSearch] ═══════════════════════════════════════════════════════")
+            total_ms = (_t.time() - t_start) * 1000
+            print(f"[WebSearch] ║ ❌ Brave AI Mode TIMEOUT after {total_ms:.0f}ms")
+            print(f"[WebSearch] ╚══════════════════════════════════════════════════════════════")
             return None
         except Exception as e:
-            print(f"[WebSearch] ❌ AI Mode error: {type(e).__name__}: {e}")
-            print(f"[WebSearch] ═══════════════════════════════════════════════════════")
+            total_ms = (_t.time() - t_start) * 1000
+            print(f"[WebSearch] ║ ❌ Brave AI Mode error after {total_ms:.0f}ms: {type(e).__name__}: {e}")
+            print(f"[WebSearch] ╚══════════════════════════════════════════════════════════════")
             return None
-            return None
+
+    @staticmethod
+    def _strip_brave_markdown_for_voice(text: str) -> str:
+        """Strip markdown formatting from Brave AI Mode output for TTS.
+
+        Brave's 'markdown' field often includes:
+          - Headers (### Coffee, ## Section)
+          - Inline citation markers [0] [1] [2]
+          - **bold** and *italic* markers
+          - Trailing "### References" section with all citation URLs
+          - Bullet points (- item, * item)
+
+        Sam shouldn't read any of that aloud. Strip everything to clean prose.
+        Keeps the helper local to WebSearch so we don't depend on server.py's
+        version (which is more aggressive and meant for written profile output).
+        """
+        if not text:
+            return ""
+        s = text
+
+        # Drop trailing References / Sources / Citations block (everything after
+        # the last "### References" heading or similar)
+        s = re.sub(
+            r"\s*#{1,6}\s*(References|Sources|Citations)\b.*$",
+            "",
+            s,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        # Drop bare numeric citation markers like [0] [1] [12] [^3]
+        s = re.sub(r"\[\^?\d+\]", "", s)
+
+        # Convert inline markdown links [text](url) → "text"
+        s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)
+
+        # Strip headers (### Title → Title)
+        s = re.sub(r"^\s*#{1,6}\s+", "", s, flags=re.MULTILINE)
+
+        # Strip bold/italic markers
+        s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)
+        s = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", s)
+
+        # Strip mid-line headers and bullets
+        s = re.sub(r"\s*#{1,6}\s+", " ", s)
+        s = re.sub(r"(?:^|\s)[-*•]\s+", " ", s)
+
+        # Unescape common backslash-escaped punctuation
+        s = s.replace("\\(", "(").replace("\\)", ")")
+        s = s.replace("\\-", "-").replace("\\+", "+")
+        s = s.replace("\\&", "&").replace("\\.", ".")
+        s = s.replace("\\,", ",").replace("\\:", ":")
+
+        # Collapse whitespace
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+
+
 
     async def close(self):
         await self._client.aclose()
@@ -1492,8 +2211,29 @@ SILENT_MP3_B64 = "SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU4LjI5LjEwMAAAAAAAAAAAAAAA//
 
 
 class RecallBot:
-    def __init__(self):
-        self.api_key = os.environ["RECALLAI_API_KEY"]
+    def __init__(self, session_id: str | None = None):
+        # Stage R: sticky per-session key. The Recall key is locked to one
+        # bot for its entire lifetime, so a rate-limited key on one bot
+        # can't take down others.
+        #
+        # session_id is optional — if not provided, fall back to a fresh
+        # round-robin key (Mode B style). Callers that want sticky-per-bot
+        # binding should pass a stable session_id.
+        from key_rotator import load_keys as _load_keys, key_for_session, key_for_request
+        _load_keys("RECALLAI")  # warm cache (also reads RECALLAI_API_KEY singular)
+
+        if session_id:
+            self.api_key = key_for_session("RECALLAI", session_id) or ""
+        else:
+            self.api_key = key_for_request("RECALLAI") or ""
+
+        # Defensive fallback: if rotator returned nothing (no env vars at all),
+        # try the legacy singular env var directly so we fail loudly with the
+        # same KeyError as before instead of silently sending an empty token.
+        if not self.api_key:
+            self.api_key = os.environ["RECALLAI_API_KEY"]
+
+        self.session_id = session_id  # remember for cleanup later if needed
         self.bot_id: str | None = None
         self.headers = {
             "Authorization": f"Token {self.api_key}",
@@ -1507,10 +2247,11 @@ class RecallBot:
         AssemblyAI:
             speech_model is REQUIRED (confirmed by Recall.ai support on
             Apr 22 2026 — AssemblyAI rejects requests without it with
-            error_code 3006). Valid values for streaming: "universal" or
-            "universal_streaming" — starting with "universal" per their
-            current API docs. If this value is wrong, try "best" or
-            "nano" as fallbacks.
+            error_code 3006). As of Apr 30 2026, Recall.ai's schema
+            validates this against an enum: ['universal-streaming-english',
+            'universal-streaming-multilingual', 'whisper-rt', 'u3-rt-pro'].
+            We use 'u3-rt-pro' to match the existing "Universal-3 Pro"
+            label this codebase uses elsewhere.
 
             Turn detection tuning:
               min_turn_silence: 400ms — silence before turn COULD end
@@ -1527,9 +2268,12 @@ class RecallBot:
         if USE_ASSEMBLYAI:
             return {
                 "assembly_ai_v3_streaming": {
-                    # REQUIRED — Recall.ai's schema doesn't list this but
-                    # AssemblyAI's backend rejects requests without it.
-                    "speech_model": "universal",
+                    # REQUIRED. Must match Recall.ai's enum:
+                    #   'universal-streaming-english'
+                    #   'universal-streaming-multilingual'
+                    #   'whisper-rt'
+                    #   'u3-rt-pro'  ← Universal-3 RT Pro (what we want)
+                    "speech_model": "u3-rt-pro",
                     # Turn detection — keeps Sam from cutting off on pauses
                     "min_turn_silence": 400,
                     "max_turn_silence": 1280,
@@ -1575,10 +2319,11 @@ class RecallBot:
                    "Zoom" if "zoom.us" in meeting_url else "Unknown"
 
         # Decide STT strategy:
-        #   - Standup mode → always use Recall.ai STT (AssemblyAI/Deepgram)
-        #   - Client mode + USE_PER_SPEAKER_FLUX → NO Recall.ai STT, we run our own
-        #   - Client mode + toggle off → fall back to Recall.ai STT
-        use_recall_stt = (mode == "standup") or (not USE_PER_SPEAKER_FLUX)
+        #   - USE_PER_SPEAKER_FLUX=1 (default) → NO Recall.ai STT in either mode.
+        #     Both client and standup rely on the user's own Deepgram Flux pipeline.
+        #   - USE_PER_SPEAKER_FLUX=0 → fall back to Recall.ai STT (AssemblyAI/Nova-3).
+        #     Legacy behavior; preserved for backward compatibility.
+        use_recall_stt = not USE_PER_SPEAKER_FLUX
 
         if use_recall_stt:
             stt_label = "AssemblyAI Universal-3 Pro" if USE_ASSEMBLYAI else "Deepgram Nova-3"
