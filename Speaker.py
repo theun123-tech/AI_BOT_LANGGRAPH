@@ -87,11 +87,38 @@ CARTESIA_WS_URL   = "wss://api.cartesia.ai/tts/websocket"
 
 
 class CartesiaSpeaker:
-    def __init__(self, bot_id: str = None):
+    def __init__(self, bot_id: str = None, session_id: str = None):
         import Speaker as _self_module
         print(f"[Speaker] Loaded from: {_self_module.__file__}")
-        self.recall_key = os.environ["RECALLAI_API_KEY"]
+
+        # Stage R: Recall key from rotator. Sticky-per-session when session_id
+        # given (matches the key bound to RecallBot). Falls back to per-request
+        # rotation for warmup instances created without a session.
+        try:
+            from key_rotator import (
+                load_keys as _load_keys,
+                key_for_session as _key_for_session,
+                key_for_request as _key_for_request,
+            )
+            _load_keys("RECALLAI")  # warm cache (also reads RECALLAI_API_KEY singular)
+            if session_id:
+                self.recall_key = _key_for_session("RECALLAI", session_id) or ""
+            else:
+                self.recall_key = _key_for_request("RECALLAI") or ""
+        except Exception:
+            self.recall_key = ""
+
+        # Defensive fallback: if rotator returned nothing AND legacy singular
+        # is set, use that. If neither is set, raise the same KeyError shape
+        # the original code did so missing config fails loudly.
+        if not self.recall_key:
+            self.recall_key = os.environ.get("RECALLAI_API_KEY") \
+                or os.environ.get("RECALLAI_API_KEYS", "").split(",")[0].strip()
+        if not self.recall_key:
+            raise KeyError("RECALLAI_API_KEY")  # match original behavior
+
         self.bot_id     = bot_id
+        self.session_id = session_id
 
         base_dir = os.path.dirname(os.path.abspath(__file__))
         noise_path = os.path.join(base_dir, NOISE_FILE)
@@ -106,15 +133,15 @@ class CartesiaSpeaker:
         self._base_noise = self._noise_slices if self._noise_slices else None
         limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
 
-        # Multi-key Cartesia setup
-        self._cartesia_keys = []
-        for key_name in ["CARTESIA_API_KEY", "CARTESIA_API_KEY_2", "CARTESIA_API_KEY_3", "CARTESIA_API_KEY_4", "CARTESIA_API_KEY_5"]:
-            val = os.environ.get(key_name, "").strip()
-            if val:
-                self._cartesia_keys.append(val)
+        # Multi-key Cartesia setup — uses shared rotator (Stage R: key rotator).
+        # Reads CARTESIA_API_KEYS (comma-separated, any count) and
+        # CARTESIA_API_KEY (singular, backward compat). Legacy numbered
+        # variables CARTESIA_API_KEY_2..N are also picked up automatically.
+        from key_rotator import load_keys as _load_keys
+        self._cartesia_keys = _load_keys("CARTESIA")
 
         if not self._cartesia_keys:
-            raise ValueError("No CARTESIA_API_KEY found in environment")
+            raise ValueError("No CARTESIA_API_KEY(S) found in environment")
 
         print(f"[Speaker] {len(self._cartesia_keys)} Cartesia key(s) loaded")
         self._key_index = 0
