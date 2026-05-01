@@ -350,6 +350,38 @@ select.fi{cursor:pointer;appearance:auto}
       </div>
     </div>
 
+    <!-- Client research (Know About Them) -->
+    <div class="setup-sec">
+      <div class="setup-sec-t">🔍 Know about your clients <span style="color:var(--muted);font-weight:400;text-transform:none;letter-spacing:0">(grounds Sam in their business)</span></div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <div>
+          <div style="font-size:12px;color:var(--text2);margin-bottom:4px">Client names (comma-separated)</div>
+          <input type="text" id="client-names-input" class="fi" placeholder="e.g. Mardochée, Sabina Michel" oninput="_onClientFieldsChanged()">
+        </div>
+        <div>
+          <div style="font-size:12px;color:var(--text2);margin-bottom:4px">Company names (comma-separated)</div>
+          <input type="text" id="company-names-input" class="fi" placeholder="e.g. Life of Hope, Acme Inc" oninput="_onClientFieldsChanged()">
+        </div>
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <button id="know-about-btn" class="btn btn-s" style="padding:8px 16px" onclick="researchClients()" disabled>🔎 Know About Them</button>
+          <span id="cp-status" style="font-size:12px;color:var(--muted)"></span>
+        </div>
+        <div id="cp-result" style="display:none;margin-top:10px;border:1px solid var(--border);border-radius:8px;padding:12px;background:var(--bg2)">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+            <div style="font-size:13px;font-weight:600;color:var(--text)">📋 Profile (edit if needed before saving)</div>
+            <div id="cp-wordcount" style="font-size:12px;color:var(--muted)">0 / 300 words</div>
+          </div>
+          <textarea id="cp-textarea" class="fi" rows="8" style="width:100%;font-family:inherit;line-height:1.5;resize:vertical" placeholder="Profile will appear here…" oninput="_onProfileEdited()"></textarea>
+          <div id="cp-diagnostic" style="display:none;margin-top:8px;padding:8px 10px;background:var(--bg);border:1px dashed var(--border);border-radius:6px;font-size:11px;color:var(--muted);font-family:monospace"></div>
+          <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+            <button class="btn btn-s" style="padding:6px 14px;background:#2ea043" onclick="saveClientProfile()">✓ Save profile</button>
+            <button class="btn btn-s" style="padding:6px 14px" onclick="researchClients()">↻ Try again</button>
+            <button class="btn btn-s" style="padding:6px 14px;background:var(--bg);color:var(--text)" onclick="clearClientProfile()">✗ Clear</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Duration -->
     <div class="setup-sec">
       <div class="setup-sec-t">⏱ Planned duration</div>
@@ -491,8 +523,8 @@ async function loadTr(id){const el=document.getElementById('tr-'+id);if(el.class
 
 async function loadSettings(){try{const d=await api('GET','/api/settings');if(!d)return;const j=d.jira||{},a=d.azure||{},sl=d.simli||{};document.getElementById('set-jurl').value=j.url||'';document.getElementById('set-jemail').value=j.email||'';document.getElementById('set-jproject').value=j.project||'';_jiraUrl=(j.url||'').replace(/\/+$/,'');document.getElementById('set-aep').value=a.endpoint||'';document.getElementById('set-adep').value=a.deployment||'';document.getElementById('set-simli-on').checked=!!sl.enabled;document.getElementById('set-simli-face').value=sl.face_id||'';updateSimliToggle();if(j.project)loadProjects()}catch(e){}}
 async function saveSettings(){const m=document.getElementById('set-msg');try{const d=await api('POST','/api/settings/save',{jira_url:document.getElementById('set-jurl').value.trim(),jira_email:document.getElementById('set-jemail').value.trim(),jira_token:document.getElementById('set-jtoken').value.trim()||undefined,jira_project:document.getElementById('set-jproject').value,jira_sprint:document.getElementById('set-jsprint').value,azure_endpoint:document.getElementById('set-aep').value.trim(),azure_key:document.getElementById('set-akey').value.trim()||undefined,azure_deployment:document.getElementById('set-adep').value.trim(),simli_enabled:document.getElementById('set-simli-on').checked,simli_api_key:document.getElementById('set-simli-key').value.trim()||undefined,simli_face_id:document.getElementById('set-simli-face').value.trim()});if(d&&d.ok)showMsg(m,'Settings saved!','ok');else showMsg(m,d?.error||'Failed','err')}catch(e){showMsg(m,'Save failed','err')}}
-async function testJira(){const b=document.getElementById('btn-jtest');b.textContent='Testing...';b.className='btn-test';try{const d=await api('POST','/api/settings/jira/test');if(d&&d.ok){b.textContent='✅ Connected';b.className='btn-test ok'}else{b.textContent='❌ '+(d?.error||'Failed');b.className='btn-test fail'}}catch(e){b.textContent='❌ Error';b.className='btn-test fail'}setTimeout(()=>{b.textContent='Test Connection';b.className='btn-test'},5000)}
-async function loadProjects(){const sel=document.getElementById('set-jproject');const cur=sel.value;try{const d=await api('GET','/api/jira/projects');if(!d||!d.projects)return;sel.innerHTML='<option value="">Select project...</option>';d.projects.forEach(p=>{const o=document.createElement('option');o.value=p.key;o.textContent=`${p.key} — ${p.name}`;sel.appendChild(o)});if(cur)sel.value=cur}catch(e){}}
+async function testJira(){const b=document.getElementById('btn-jtest');b.textContent='Testing...';b.className='btn-test';try{const payload={base_url:document.getElementById('set-jurl').value.trim(),email:document.getElementById('set-jemail').value.trim(),token:document.getElementById('set-jtoken').value.trim(),project:document.getElementById('set-jproject').value.trim()};const d=await api('POST','/api/settings/jira/test',payload);if(d&&d.ok){b.textContent='✅ Connected';b.className='btn-test ok'}else{b.textContent='❌ '+(d?.error||'Failed');b.className='btn-test fail'}}catch(e){b.textContent='❌ Error';b.className='btn-test fail'}setTimeout(()=>{b.textContent='Test Connection';b.className='btn-test'},5000)}
+async function loadProjects(){const sel=document.getElementById('set-jproject');const cur=sel.value;try{const payload={base_url:document.getElementById('set-jurl').value.trim(),email:document.getElementById('set-jemail').value.trim(),token:document.getElementById('set-jtoken').value.trim()};const d=await api('POST','/api/jira/projects',payload);if(!d||!d.projects)return;sel.innerHTML='<option value="">Select project...</option>';d.projects.forEach(p=>{const o=document.createElement('option');o.value=p.key;o.textContent=`${p.key} — ${p.name}`;sel.appendChild(o)});if(cur)sel.value=cur}catch(e){}}
 async function loadSprints(){const proj=document.getElementById('set-jproject').value;const sel=document.getElementById('set-jsprint');sel.innerHTML='<option value="">Auto-detect active sprint</option>';if(!proj)return;try{const d=await api('GET',`/api/jira/sprints?project=${proj}`);if(!d||!d.sprints)return;d.sprints.forEach(s=>{const o=document.createElement('option');o.value=s.id;o.textContent=`${s.name} (${s.state})`;sel.appendChild(o)})}catch(e){}}
 async function loadPending(){try{const d=await api('GET','/api/pending');const banner=document.getElementById('pending-banner');if(d&&d.count>0){document.getElementById('pending-ct').textContent=d.count;banner.classList.remove('hidden')}else{banner.classList.add('hidden')}}catch(e){}}
 async function syncPending(){try{const d=await api('POST','/api/pending/sync');if(d){const m=document.getElementById('set-msg');showMsg(m,`Synced ${d.synced||0} ticket(s), ${d.failed||0} failed`,'ok');loadPending()}}catch(e){}}
@@ -976,6 +1008,167 @@ function _updateSetupBadge(){
   }
 }
 
+// ── Client research (Know About Them) state ────────────────────────────────
+let _clientProfileSaved = "";   // verified text user clicked "Save profile" on
+let _clientFieldsAtSave = "";   // names captured at save time (for staleness detection)
+
+function _onClientFieldsChanged(){
+  const cn = document.getElementById('client-names-input').value.trim();
+  const co = document.getElementById('company-names-input').value.trim();
+  // Enable button only when at least one field is non-empty
+  document.getElementById('know-about-btn').disabled = !(cn || co);
+
+  // Soft staleness warning — saved profile may be outdated if names changed
+  const status = document.getElementById('cp-status');
+  if(_clientProfileSaved){
+    const currentSig = `${cn}|${co}`;
+    if(currentSig !== _clientFieldsAtSave){
+      status.textContent = "⚠️ Names changed — saved profile may be stale. Re-fetch?";
+      status.style.color = "#d29922";
+    }else{
+      status.textContent = `✓ Profile saved (${_clientProfileSaved.split(/\s+/).filter(Boolean).length} words)`;
+      status.style.color = "#2ea043";
+    }
+  }
+}
+
+async function researchClients(){
+  const cn = document.getElementById('client-names-input').value.trim();
+  const co = document.getElementById('company-names-input').value.trim();
+  if(!cn && !co){
+    alert('Please enter at least one client name or company name.');
+    return;
+  }
+
+  const btn = document.getElementById('know-about-btn');
+  const status = document.getElementById('cp-status');
+  const resultBox = document.getElementById('cp-result');
+  const ta = document.getElementById('cp-textarea');
+
+  btn.disabled = true;
+  btn.textContent = '🔎 Researching...';
+  status.textContent = 'Calling Google AI Mode...';
+  status.style.color = 'var(--muted)';
+  resultBox.style.display = 'none';
+
+  try{
+    const token = localStorage.getItem('sam_token') || '';
+    const r = await fetch('/api/clients/research', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + token,
+      },
+      body: JSON.stringify({client_names: cn, company_names: co}),
+    });
+    const data = await r.json();
+
+    if(!r.ok){
+      status.textContent = '❌ ' + (data.error || 'Research failed');
+      status.style.color = '#f85149';
+      btn.disabled = false;
+      btn.textContent = '🔎 Know About Them';
+      return;
+    }
+
+    if(data.warning){
+      status.textContent = '⚠️ ' + data.warning;
+      status.style.color = '#d29922';
+    }else{
+      status.textContent = `✓ Got profile (${data.word_count} words). Review and edit, then click Save.`;
+      status.style.color = '#2ea043';
+    }
+
+    ta.value = data.profile_text || '';
+    resultBox.style.display = '';
+    _updateWordCount();
+
+    // Show diagnostic block — what fields Google AI Mode actually returned
+    const diagBox = document.getElementById('cp-diagnostic');
+    if(data.diagnostic){
+      const d = data.diagnostic;
+      const keysStr = (d.top_keys || []).join(', ') || '(none)';
+      const lines = [
+        `🔍 SerpAPI fields returned: [${keysStr}]`,
+        `📊 Extraction strategy: ${d.extraction_strategy || 'none'}`,
+        `⏱ Latency: ${d.latency_ms || '?'}ms`,
+      ];
+      if(d.reference_count !== undefined){
+        lines.push(`📚 References-only response (${d.reference_count} citations, no synthesis)`);
+      }
+      if(d.debug_file){
+        lines.push(`💾 Full JSON saved on server: ${d.debug_file}`);
+      }
+      diagBox.innerHTML = lines.map(l => esc(l)).join('<br>');
+      diagBox.style.display = '';
+    }else{
+      diagBox.style.display = 'none';
+    }
+
+    btn.disabled = false;
+    btn.textContent = '🔎 Know About Them';
+  }catch(e){
+    status.textContent = '❌ Network error: ' + e.message;
+    status.style.color = '#f85149';
+    btn.disabled = false;
+    btn.textContent = '🔎 Know About Them';
+  }
+}
+
+function _updateWordCount(){
+  const ta = document.getElementById('cp-textarea');
+  const wc = document.getElementById('cp-wordcount');
+  const words = ta.value.trim().split(/\s+/).filter(Boolean);
+  const n = words.length;
+  wc.textContent = `${n} / 300 words`;
+  if(n > 300){
+    wc.style.color = '#f85149';
+  }else if(n > 250){
+    wc.style.color = '#d29922';
+  }else{
+    wc.style.color = 'var(--muted)';
+  }
+}
+
+function _onProfileEdited(){
+  const ta = document.getElementById('cp-textarea');
+  // Hard cap at 300 words client-side (truncate excess, keep cursor sensible)
+  const words = ta.value.trim().split(/\s+/).filter(Boolean);
+  if(words.length > 300){
+    ta.value = words.slice(0, 300).join(' ');
+  }
+  _updateWordCount();
+}
+
+function saveClientProfile(){
+  const ta = document.getElementById('cp-textarea');
+  const text = ta.value.trim();
+  if(!text){
+    alert('Profile is empty. Click "Try again" or write something first.');
+    return;
+  }
+  _clientProfileSaved = text;
+  const cn = document.getElementById('client-names-input').value.trim();
+  const co = document.getElementById('company-names-input').value.trim();
+  _clientFieldsAtSave = `${cn}|${co}`;
+
+  const status = document.getElementById('cp-status');
+  const wc = text.split(/\s+/).filter(Boolean).length;
+  status.textContent = `✓ Profile saved (${wc} words) — will be sent to Sam when you start the meeting`;
+  status.style.color = '#2ea043';
+  _updateSetupBadge();
+}
+
+function clearClientProfile(){
+  _clientProfileSaved = "";
+  _clientFieldsAtSave = "";
+  document.getElementById('cp-textarea').value = '';
+  document.getElementById('cp-result').style.display = 'none';
+  document.getElementById('cp-status').textContent = '';
+  _updateWordCount();
+  _updateSetupBadge();
+}
+
 function _gatherSetup(){
   const agenda = _agendaItems
     .filter(a => a.title.trim())
@@ -988,8 +1181,9 @@ function _gatherSetup(){
   const participants = participantsRaw
     ? participantsRaw.split(/[,\n]/).map(s => s.trim()).filter(Boolean)
     : [];
+  const clientProfile = (_clientProfileSaved || "").trim();
   // Return {} if nothing filled in — backend treats empty as "no setup"
-  if(!agenda.length && !scopeIn.length && !scopeOut.length && !ticketKeys.length){
+  if(!agenda.length && !scopeIn.length && !scopeOut.length && !ticketKeys.length && !clientProfile){
     return null;
   }
   return {
@@ -999,6 +1193,7 @@ function _gatherSetup(){
     ticket_keys: ticketKeys,
     planned_duration_minutes: duration,
     expected_participants: participants,
+    client_profile: clientProfile,
   };
 }
 
