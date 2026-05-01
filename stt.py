@@ -557,7 +557,7 @@ FLUX_SAMPLE_RATE = 16000
 # Flux STT parameters (tuned for client meetings)
 # Higher eot_threshold = wait longer for confident turn end
 # Lower eot_timeout_ms = force turn end sooner on ambiguous silence
-FLUX_EOT_THRESHOLD = 0.65          # 0-1; higher = more confident EOT required
+FLUX_EOT_THRESHOLD = 0.75          # 0-1; higher = more confident EOT required
 FLUX_EAGER_EOT_THRESHOLD = 0.35    # 0-1; when to emit EagerEndOfTurn
 FLUX_EOT_TIMEOUT_MS = 1500         # force EOT after this much silence
 
@@ -589,8 +589,11 @@ class FluxSessionManager:
 
     Usage (in BotSession, client mode only):
 
+        # Stage R: api_key now comes from key_rotator.key_for_session(),
+        # bound to this session for its entire lifetime.
+        from key_rotator import key_for_session
         self._flux_manager = FluxSessionManager(
-            api_key=DEEPGRAM_API_KEY,
+            api_key=key_for_session("DEEPGRAM", session_id),
             on_final=self._on_flux_final_client,
             on_interim=self._on_flux_interim_client,
         )
