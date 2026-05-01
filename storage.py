@@ -73,6 +73,10 @@ def save_session(session_data: dict):
 
 def get_sessions(limit: int = 50, user: str = None) -> list[dict]:
     sessions = _load_json(SESSIONS_FILE, [])
+    # Defensive filter: standups belong in the Standups tab, not Sessions.
+    # This hides any historical standup entries that were saved before the
+    # save-side guard in _post_meeting_save was added.
+    sessions = [s for s in sessions if s.get("mode") != "standup"]
     if user:
         sessions = [s for s in sessions if s.get("user") == user]
     summaries = []
@@ -399,4 +403,3 @@ def delete_agenda_template(user: str, name: str) -> bool:
         all_templates[user] = user_templates
         _save_json(AGENDA_TEMPLATES_FILE, all_templates)
     return True
-
